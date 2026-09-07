@@ -23,6 +23,10 @@ final class LoggedTrip {
     /// "average commute" rollup on the History tab. Defaults to 0 for rows written
     /// before this field existed (lightweight SwiftData migration).
     var expectedDurationMinutes: Int = 0
+    /// Intermediate stops in visit order, so History can show the exact route driven
+    /// (not just origin/destination). Empty for rows written before this field existed.
+    var stopAddresses: [String] = []
+    var travelModeRaw: String = TravelMode.driving.rawValue
 
     init(
         origin: String,
@@ -31,6 +35,8 @@ final class LoggedTrip {
         predictedSavedMinutes: Int,
         confidencePercent: Int,
         expectedDurationMinutes: Int = 0,
+        stopAddresses: [String] = [],
+        travelMode: TravelMode = .driving,
         createdAt: Date = Date()
     ) {
         self.origin = origin
@@ -39,6 +45,12 @@ final class LoggedTrip {
         self.predictedSavedMinutes = predictedSavedMinutes
         self.confidencePercent = confidencePercent
         self.expectedDurationMinutes = expectedDurationMinutes
+        self.stopAddresses = stopAddresses
+        self.travelModeRaw = travelMode.rawValue
         self.createdAt = createdAt
+    }
+
+    var travelMode: TravelMode {
+        TravelMode(rawValue: travelModeRaw) ?? .driving
     }
 }

@@ -12,6 +12,7 @@ import SwiftUI
 import SwiftData
 
 struct RootView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @Environment(\.modelContext) private var modelContext
     @State private var isLaunching = true
 
@@ -25,6 +26,8 @@ struct RootView: View {
                     .transition(.opacity)
             }
         }
+        .tint(appSettings.accentColorChoice.color)
+        .preferredColorScheme(appSettings.appearanceMode.colorScheme)
         .animation(.easeInOut(duration: 0.35), value: isLaunching)
         .task {
             DemoSeedData.seedIfNeeded(modelContext: modelContext)
@@ -37,5 +40,5 @@ struct RootView: View {
 #Preview {
     RootView()
         .environmentObject(AppSettings())
-        .modelContainer(for: [HistoricalSample.self, LoggedTrip.self, SavedCommute.self, FavoriteLocation.self], inMemory: true)
+        .modelContainer(for: [HistoricalSample.self, LoggedTrip.self, SavedCommute.self, FavoriteLocation.self, ReminderItem.self, RecurringReminder.self], inMemory: true)
 }

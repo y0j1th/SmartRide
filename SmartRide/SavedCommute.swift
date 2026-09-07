@@ -22,6 +22,11 @@ final class SavedCommute {
     /// Baseline duration (minutes) the alert last compared against, so we only fire
     /// again when conditions have moved, not on every check.
     var lastAlertedDurationMinutes: Int?
+    /// Distinguishes the Routes tab's "Favorite" section from its plain "Saved
+    /// Routes" section — both are saved commutes, this just marks the ones the
+    /// user singled out as favorites. Defaults false for rows written before this
+    /// field existed (lightweight SwiftData migration).
+    var isFavorite: Bool = false
 
     init(
         name: String,
@@ -29,6 +34,7 @@ final class SavedCommute {
         destination: String,
         targetArrivalMinuteOfDay: Int? = nil,
         alertsEnabled: Bool = false,
+        isFavorite: Bool = false,
         createdAt: Date = Date()
     ) {
         self.name = name
@@ -36,6 +42,7 @@ final class SavedCommute {
         self.destination = destination
         self.targetArrivalMinuteOfDay = targetArrivalMinuteOfDay
         self.alertsEnabled = alertsEnabled
+        self.isFavorite = isFavorite
         self.createdAt = createdAt
     }
 }

@@ -2,8 +2,8 @@
 //  AddFavoriteView.swift
 //  SmartRide
 //
-//  Sheet for setting a Home/Office address, or adding a custom frequent location.
-//  Editing an existing favorite is the same form, pre-filled.
+//  Sheet for setting a Home or Office address. Editing an existing favorite is
+//  the same form, pre-filled.
 //
 
 import SwiftUI
@@ -24,30 +24,34 @@ struct AddFavoriteView: View {
     init(kind: FavoriteKind, existing: FavoriteLocation? = nil) {
         self.kind = kind
         self.existing = existing
-        _name = State(initialValue: existing?.name ?? (kind == .custom ? "" : kind.rawValue.capitalized))
+        _name = State(initialValue: existing?.name ?? kind.rawValue.capitalized)
         _address = State(initialValue: existing?.address ?? "")
     }
 
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private var isValid: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !trimmedName.isEmpty
             && !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
         NavigationStack {
-            Form {
-                if kind == .custom {
-                    Section("Name") {
-                        TextField("e.g. Gym, Parents' House", text: $name)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("ADDRESS")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        LocationSearchField(placeholder: "Search for an address", text: $address, coordinate: $coordinate)
                     }
+                    Spacer(minLength: 0)
                 }
-                Section("Address") {
-                    LocationSearchField(placeholder: "Search for an address", text: $address, coordinate: $coordinate)
-                        .listRowInsets(EdgeInsets())
-                        .padding(12)
-                }
+                .padding()
             }
-            .navigationTitle(kind == .custom ? "Add Favorite" : name)
+            .navigationTitle(name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -62,7 +66,6 @@ struct AddFavoriteView: View {
     }
 
     private func save() {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if let existing {
             existing.name = trimmedName
             existing.address = address

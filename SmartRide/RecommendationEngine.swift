@@ -39,7 +39,6 @@ enum RecommendationEngine {
     private static let candidateStepMinutes = 10
     private static let candidateWindowMinutes = 150 // ~2.5 hours of continuous prediction
     private static let liveHorizonMinutes = 150.0
-    private static let fallbackAverageSpeedMph = 45.0
 
     // MARK: - Depart-At mode
 
@@ -84,6 +83,7 @@ enum RecommendationEngine {
         let recommendation = Recommendation(
             referenceNow: referenceDate,
             mode: .departAt,
+            travelMode: trip.travelMode,
             recommendedTime: best.time,
             expectedDurationMinutes: best.durationMinutes,
             durationRangeMinutes: range,
@@ -171,6 +171,7 @@ enum RecommendationEngine {
         let recommendation = Recommendation(
             referenceNow: referenceDate,
             mode: .arriveBy,
+            travelMode: trip.travelMode,
             recommendedTime: best.time,
             expectedDurationMinutes: best.durationMinutes,
             durationRangeMinutes: range,
@@ -194,8 +195,23 @@ enum RecommendationEngine {
 
     // MARK: - Shared context (geocoding + one live routes fetch)
 
+    /// A route alternative reduced to just what the rest of the engine and the UI
+    /// actually need. Exists so a single fetched MKRoute (the common case) and a
+    /// synthesized multi-stop route (several legs stitched into one) can flow
+    /// through the exact same scoring and display code — MKRoute itself can't be
+    /// constructed by hand, so a multi-leg trip has nothing else to stand in as one.
+    private struct LiveRoute {
+        let id = UUID()
+        let name: String?
+        let expectedTravelTime: TimeInterval
+        let distance: CLLocationDistance
+        let hasTolls: Bool
+        let highwaySummary: String?
+        let polyline: MKPolyline?
+    }
+
     private struct Context {
-        let liveRoutes: [MKRoute]?
+        let liveRoutes: [LiveRoute]?
         let liveNowMinutes: Double?
         let fallbackMinutes: Double
         let straightLineMiles: Double
@@ -211,21 +227,39 @@ enum RecommendationEngine {
     ) async -> Context? {
         let originLocation: CLLocation
         let destinationLocation: CLLocation
+        var stopLocations: [CLLocation] = []
         do {
             originLocation = try await resolveLocation(text: trip.origin, coordinate: trip.originCoordinate)
             destinationLocation = try await resolveLocation(text: trip.destination, coordinate: trip.destinationCoordinate)
+            for stop in trip.filledStops {
+                stopLocations.append(try await resolveLocation(text: stop.address, coordinate: stop.coordinate))
+            }
         } catch {
             return nil
         }
 
         let straightLineMiles = originLocation.distance(from: destinationLocation) / 1609.34
-        let fallbackMinutes = max(5.0, (straightLineMiles / fallbackAverageSpeedMph) * 60.0)
+        let fallbackMinutes = max(5.0, (straightLineMiles / trip.travelMode.fallbackAverageSpeedMph) * 60.0)
 
-        var liveRoutes: [MKRoute]?
+        var liveRoutes: [LiveRoute]?
+        let scaleFactor = trip.travelMode.durationScaleFactor
         if !simulateFailure {
-            liveRoutes = try? await fetchRoutes(
-                from: originLocation.coordinate, to: destinationLocation.coordinate, departureDate: liveDepartureDate
-            )
+            if stopLocations.isEmpty {
+                if let mkRoutes = try? await fetchRoutes(
+                    from: originLocation.coordinate, to: destinationLocation.coordinate,
+                    departureDate: liveDepartureDate, transportType: trip.travelMode.mkTransportType
+                ) {
+                    liveRoutes = mkRoutes.map { liveRoute(from: $0, scaleFactor: scaleFactor) }
+                }
+            } else {
+                let waypoints = [originLocation.coordinate] + stopLocations.map(\.coordinate) + [destinationLocation.coordinate]
+                if let combined = try? await fetchMultiLegRoute(
+                    waypoints: waypoints, departureDate: liveDepartureDate,
+                    transportType: trip.travelMode.mkTransportType, scaleFactor: scaleFactor
+                ) {
+                    liveRoutes = [combined]
+                }
+            }
         }
         let liveNowMinutes = liveRoutes?.map { $0.expectedTravelTime / 60 }.min()
 
@@ -238,6 +272,17 @@ enum RecommendationEngine {
             straightLineMiles: straightLineMiles, history: history,
             historicalPointsUsed: history.count, routeKey: routeKey,
             originCoordinate: originLocation.coordinate, destinationCoordinate: destinationLocation.coordinate
+        )
+    }
+
+    private static func liveRoute(from route: MKRoute, scaleFactor: Double) -> LiveRoute {
+        LiveRoute(
+            name: route.name.isEmpty ? nil : route.name,
+            expectedTravelTime: route.expectedTravelTime * scaleFactor,
+            distance: route.distance,
+            hasTolls: route.advisoryNotices.contains { $0.localizedCaseInsensitiveContains("toll") },
+            highwaySummary: highwayChain(steps: route.steps),
+            polyline: route.polyline
         )
     }
 
@@ -292,14 +337,14 @@ enum RecommendationEngine {
     /// Applies a time-sensitivity multiplier per route (see file header) and returns
     /// the best (minimum) duration across all fetched routes for this time factor —
     /// this is the joint route+departure-time optimization.
-    private static func candidateDuration(timeFactor: Double, liveRoutes: [MKRoute]?, fallbackMinutes: Double) -> Int {
+    private static func candidateDuration(timeFactor: Double, liveRoutes: [LiveRoute]?, fallbackMinutes: Double) -> Int {
         guard let liveRoutes, !liveRoutes.isEmpty else {
             return Int((fallbackMinutes * timeFactor).rounded())
         }
         let fastest = liveRoutes[0]
         let options = liveRoutes.map { route -> Double in
             let sensitivity: Double
-            if route === fastest {
+            if route.id == fastest.id {
                 sensitivity = 1.3
             } else {
                 let ratio = route.expectedTravelTime / fastest.expectedTravelTime
@@ -356,18 +401,67 @@ enum RecommendationEngine {
     }
 
     private static func fetchRoutes(
-        from origin: CLLocationCoordinate2D, to destination: CLLocationCoordinate2D, departureDate: Date
+        from origin: CLLocationCoordinate2D, to destination: CLLocationCoordinate2D,
+        departureDate: Date, transportType: MKDirectionsTransportType
     ) async throws -> [MKRoute] {
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: origin))
         request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
-        request.transportType = .automobile
+        request.transportType = transportType
         request.departureDate = departureDate
         request.requestsAlternateRoutes = true
 
         let response = try await MKDirections(request: request).calculate()
         guard !response.routes.isEmpty else { throw RecommendationError.directionsFailed }
         return response.routes.sorted { $0.expectedTravelTime < $1.expectedTravelTime }
+    }
+
+    /// Stitches origin → stop 1 → stop 2 → ... → destination into a single combined
+    /// route by fetching each leg separately (MKDirections has no native multi-
+    /// waypoint request) and summing durations/distances, concatenating polylines
+    /// and turn-by-turn steps. Each leg's departure is offset by the running total
+    /// so far, so the whole chain reflects one continuous trip rather than every
+    /// leg independently assuming it starts at the original departure time.
+    private static func fetchMultiLegRoute(
+        waypoints: [CLLocationCoordinate2D], departureDate: Date, transportType: MKDirectionsTransportType, scaleFactor: Double
+    ) async throws -> LiveRoute {
+        guard waypoints.count >= 2 else { throw RecommendationError.directionsFailed }
+
+        var totalTime: TimeInterval = 0
+        var totalDistance: CLLocationDistance = 0
+        var hasTolls = false
+        var allSteps: [MKRoute.Step] = []
+        var combinedCoordinates: [CLLocationCoordinate2D] = []
+        var legDeparture = departureDate
+
+        for i in 0..<(waypoints.count - 1) {
+            let request = MKDirections.Request()
+            request.source = MKMapItem(placemark: MKPlacemark(coordinate: waypoints[i]))
+            request.destination = MKMapItem(placemark: MKPlacemark(coordinate: waypoints[i + 1]))
+            request.transportType = transportType
+            request.departureDate = legDeparture
+            request.requestsAlternateRoutes = false
+
+            let response = try await MKDirections(request: request).calculate()
+            guard let leg = response.routes.first else { throw RecommendationError.directionsFailed }
+
+            totalTime += leg.expectedTravelTime
+            totalDistance += leg.distance
+            if leg.advisoryNotices.contains(where: { $0.localizedCaseInsensitiveContains("toll") }) { hasTolls = true }
+            allSteps.append(contentsOf: leg.steps)
+            combinedCoordinates.append(contentsOf: leg.polyline.coordinates)
+            legDeparture = legDeparture.addingTimeInterval(leg.expectedTravelTime)
+        }
+
+        let combinedPolyline = combinedCoordinates.isEmpty ? nil : MKPolyline(coordinates: combinedCoordinates, count: combinedCoordinates.count)
+        return LiveRoute(
+            name: "Multi-stop route",
+            expectedTravelTime: totalTime * scaleFactor,
+            distance: totalDistance,
+            hasTolls: hasTolls,
+            highwaySummary: highwayChain(steps: allSteps),
+            polyline: combinedPolyline
+        )
     }
 
     // MARK: - Window start (Depart-At)
@@ -415,7 +509,7 @@ enum RecommendationEngine {
     // MARK: - Route options
 
     private static func buildRouteOptions(
-        liveRoutes: [MKRoute]?, fallbackMinutes: Double, straightLineMiles: Double, timeFactor: Double
+        liveRoutes: [LiveRoute]?, fallbackMinutes: Double, straightLineMiles: Double, timeFactor: Double
     ) -> [RouteOption] {
         guard let liveRoutes, !liveRoutes.isEmpty else {
             return [
@@ -434,9 +528,9 @@ enum RecommendationEngine {
         }
 
         let fastest = liveRoutes[0]
-        var scored: [(route: MKRoute, minutes: Double)] = liveRoutes.map { route in
+        var scored: [(route: LiveRoute, minutes: Double)] = liveRoutes.map { route in
             let sensitivity: Double
-            if route === fastest {
+            if route.id == fastest.id {
                 sensitivity = 1.3
             } else {
                 let ratio = route.expectedTravelTime / fastest.expectedTravelTime
@@ -455,14 +549,14 @@ enum RecommendationEngine {
                 ? "Fastest option for this departure time"
                 : "+\(Int((pair.minutes - bestMinutes).rounded())) min vs. fastest"
             return RouteOption(
-                summary: pair.route.name.isEmpty ? "Route \(index + 1)" : pair.route.name,
+                summary: pair.route.name ?? "Route \(index + 1)",
                 durationMinutes: Int(pair.minutes.rounded()),
                 distanceMiles: pair.route.distance / 1609.34,
                 condition: condition,
                 delayNote: delay,
                 isFastest: index == 0,
-                hasTolls: pair.route.advisoryNotices.contains { $0.localizedCaseInsensitiveContains("toll") },
-                fullRouteSummary: highwayChain(for: pair.route),
+                hasTolls: pair.route.hasTolls,
+                fullRouteSummary: pair.route.highwaySummary,
                 polyline: pair.route.polyline
             )
         }
@@ -471,10 +565,10 @@ enum RecommendationEngine {
     /// Extracts numbered highways (I-680, US-101, CA-84, SR-84, ...) from turn-by-turn
     /// step instructions, in order, collapsing consecutive repeats — MapKit's own
     /// `route.name` often only names the primary highway, not the full chain.
-    private static func highwayChain(for route: MKRoute) -> String? {
+    private static func highwayChain(steps: [MKRoute.Step]) -> String? {
         guard let regex = try? NSRegularExpression(pattern: #"\b(?:I|US|CA|SR)-\d+(?:\s[NSEW])?\b"#) else { return nil }
         var found: [String] = []
-        for step in route.steps {
+        for step in steps {
             let text = step.instructions
             guard !text.isEmpty else { continue }
             let range = NSRange(text.startIndex..., in: text)
@@ -487,5 +581,13 @@ enum RecommendationEngine {
         }
         guard !found.isEmpty else { return nil }
         return found.joined(separator: " → ")
+    }
+}
+
+private extension MKPolyline {
+    var coordinates: [CLLocationCoordinate2D] {
+        var coords = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid, count: pointCount)
+        getCoordinates(&coords, range: NSRange(location: 0, length: pointCount))
+        return coords
     }
 }

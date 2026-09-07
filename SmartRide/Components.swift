@@ -50,6 +50,25 @@ struct TripModeSelector: View {
     }
 }
 
+// MARK: - Travel Mode Selector
+
+struct TravelModeSelector: View {
+    @Binding var mode: TravelMode
+
+    var body: some View {
+        // Icon-only: 5 full text labels don't fit a segmented control on a phone
+        // screen without truncating illegibly.
+        Picker("Travel Mode", selection: $mode) {
+            ForEach(TravelMode.allCases, id: \.self) { option in
+                Image(systemName: option.systemImage)
+                    .accessibilityLabel(option.label)
+                    .tag(option)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+}
+
 // MARK: - Departure Time Selector
 
 struct DepartureTimeSelector: View {
@@ -122,6 +141,8 @@ struct BestTimeToLeaveCard: View {
     let isLoading: Bool
     let origin: String
     let destination: String
+    var stops: [TripStop] = []
+    var travelMode: TravelMode = .driving
     var onViewAllTimes: (() -> Void)? = nil
 
     var body: some View {
@@ -173,7 +194,7 @@ struct BestTimeToLeaveCard: View {
                 .foregroundStyle(.white.opacity(0.6))
 
             if rec.candidates.count > 1 {
-                DepartureOptionCards(recommendation: rec, origin: origin, destination: destination)
+                DepartureOptionCards(recommendation: rec, origin: origin, destination: destination, stops: stops, travelMode: travelMode)
             } else if rec.alreadyOptimal {
                 Text("Already a great time to leave · \(rec.durationText) drive")
                     .font(.subheadline.weight(.medium))
@@ -245,6 +266,8 @@ struct DepartureOptionCards: View {
     let recommendation: Recommendation
     let origin: String
     let destination: String
+    var stops: [TripStop] = []
+    var travelMode: TravelMode = .driving
 
     @Environment(\.modelContext) private var modelContext
     @State private var activeReminderCandidateID: UUID?
@@ -356,9 +379,15 @@ struct DepartureOptionCards: View {
 
     private func scheduleReminder(_ candidate: CandidateResult) {
         reminderInFlightFor = candidate.id
+        let identifier = "smartride.reminder.\(UUID().uuidString)"
         Task {
-            let ok = await NotificationManager.scheduleDepartureReminder(at: candidate.time, destination: destination)
-            if ok { activeReminderCandidateID = candidate.id }
+            let ok = await NotificationManager.scheduleDepartureReminder(id: identifier, at: candidate.time, origin: origin, destination: destination, travelMode: recommendation.travelMode)
+            if ok {
+                activeReminderCandidateID = candidate.id
+                let item = ReminderItem(origin: origin, destination: destination, scheduledTime: candidate.time, notificationIdentifier: identifier, travelMode: recommendation.travelMode)
+                modelContext.insert(item)
+                try? modelContext.save()
+            }
             reminderInFlightFor = nil
         }
     }
@@ -370,7 +399,9 @@ struct DepartureOptionCards: View {
             plannedDeparture: candidate.time,
             predictedSavedMinutes: max(0, recommendation.leaveNowDurationMinutes - candidate.durationMinutes),
             confidencePercent: recommendation.confidencePercent,
-            expectedDurationMinutes: candidate.durationMinutes
+            expectedDurationMinutes: candidate.durationMinutes,
+            stopAddresses: stops.map(\.address).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+            travelMode: travelMode
         )
         modelContext.insert(logged)
         try? modelContext.save()
@@ -454,5 +485,86 @@ struct RouteOptionRow: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Reminder Row (Home's "Upcoming Reminders" list + History > Reminders)
+
+struct ReminderRowView: View {
+    let reminder: ReminderItem
+    /// History's past reminders are read-only — rescheduling or deleting one that's
+    /// already fired would edit the record of what actually happened, the same
+    /// reason a logged trip in History can't be edited either.
+    var allowEdit: Bool = true
+    var allowDelete: Bool = true
+    var onEdit: ((Date) -> Void)? = nil
+    var onDelete: (() -> Void)? = nil
+
+    @State private var showEditSheet = false
+    @State private var editDate = Date()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "bell.fill")
+                .foregroundStyle(Color.accentColor)
+                .padding(.top, 3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(reminder.destination)
+                    .font(.subheadline.weight(.semibold))
+                Text(reminder.scheduledTime.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 8)
+        // App-wide convention: swipe left-to-right (leading) for Edit, right-to-
+        // left (trailing) for Delete. An explicit tint on both since the app's
+        // custom global accent (Profile > Appearance) would otherwise override
+        // the destructive role's default red.
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            if allowEdit {
+                Button {
+                    editDate = reminder.scheduledTime
+                    showEditSheet = true
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+                .tint(.blue)
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if allowDelete {
+                Button(role: .destructive) {
+                    onDelete?()
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                .tint(.red)
+            }
+        }
+        .sheet(isPresented: $showEditSheet) {
+            NavigationStack {
+                Form {
+                    DatePicker("Remind me at", selection: $editDate, in: Date()..., displayedComponents: [.date, .hourAndMinute])
+                }
+                .navigationTitle("Edit Reminder")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showEditSheet = false }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") {
+                            onEdit?(editDate)
+                            showEditSheet = false
+                        }
+                    }
+                }
+            }
+            .presentationDetents([.height(220)])
+        }
     }
 }

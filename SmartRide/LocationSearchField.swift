@@ -2,11 +2,17 @@
 //  LocationSearchField.swift
 //  SmartRide
 //
-//  A text field with a live suggestions list underneath (business names, POIs, and
+//  A text field with a live suggestions list (business names, POIs, and
 //  addresses), so typing "crunch tracy" offers "Crunch Fitness - Tracy, CA" to tap
-//  instead of requiring a full, exact street address. The list floats as an overlay
-//  rather than a layout sibling, so opening/closing it doesn't shove the rest of
-//  the screen up and down.
+//  instead of requiring a full, exact street address.
+//
+//  Two presentations: by default the list floats as an overlay so opening/closing
+//  it doesn't shove the rest of the screen up and down — but that requires getting
+//  its z-ordering right relative to whatever sits below it, which broke down once
+//  a field could have OTHER address fields (stops) stacked below it rather than
+//  just static content. `inline: true` sidesteps that entirely by making the list
+//  a normal layout child instead of an overlay — it can never render behind
+//  anything, at the cost of pushing later rows down while it's showing.
 //
 
 import SwiftUI
@@ -16,6 +22,7 @@ struct LocationSearchField: View {
     let placeholder: String
     @Binding var text: String
     @Binding var coordinate: CLLocationCoordinate2D?
+    var inline: Bool = false
 
     @StateObject private var completer = LocationSearchCompleter()
     @FocusState private var isFocused: Bool
@@ -23,8 +30,30 @@ struct LocationSearchField: View {
     private var showSuggestions: Bool { isFocused && !completer.results.isEmpty }
 
     var body: some View {
+        if inline {
+            VStack(alignment: .leading, spacing: 6) {
+                textField
+                if showSuggestions {
+                    suggestionsList
+                }
+            }
+        } else {
+            textField
+                .overlay(alignment: .topLeading) {
+                    if showSuggestions {
+                        suggestionsList
+                            .offset(y: 44)
+                    }
+                }
+                .zIndex(isFocused ? 1 : 0)
+        }
+    }
+
+    private var textField: some View {
         TextField(placeholder, text: $text)
             .textFieldStyle(.roundedBorder)
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.words)
             .focused($isFocused)
             .onChange(of: text) { _, newValue in
                 // Only clear the coordinate when the user is actually the one
@@ -40,13 +69,6 @@ struct LocationSearchField: View {
             .onSubmit {
                 isFocused = false
             }
-            .overlay(alignment: .topLeading) {
-                if showSuggestions {
-                    suggestionsList
-                        .offset(y: 44)
-                }
-            }
-            .zIndex(isFocused ? 1 : 0)
     }
 
     private var suggestionsList: some View {
