@@ -36,9 +36,13 @@ enum RecommendationError: Error {
 
 enum RecommendationEngine {
 
-    private static let candidateStepMinutes = 10
+    private static let candidateStepMinutes = 5
     private static let candidateWindowMinutes = 150 // ~2.5 hours of continuous prediction
     private static let liveHorizonMinutes = 150.0
+    /// Minutes of extra drive time per minute of delay past which a jump counts as
+    /// a "cliff" rather than ordinary traffic drift — tuned so a slow, steady climb
+    /// doesn't trigger it, but the sharp knee where rush hour actually bites does.
+    private static let trafficCliffSlopeThreshold = 0.6
 
     // MARK: - Depart-At mode
 
@@ -73,10 +77,12 @@ enum RecommendationEngine {
         var confidence = confidenceScore(best: Double(best.durationMinutes), all: durations)
         if ctx.liveNowMinutes == nil { confidence -= 15 }
         if ctx.historicalPointsUsed < 3 { confidence -= 15 }
+        confidence += accuracyConfidenceAdjustment(routeKey: ctx.routeKey, modelContext: modelContext)
         confidence = min(97, max(30, confidence))
 
         let range = durationRange(around: best.durationMinutes, all: durations)
         let routes = buildRouteOptions(liveRoutes: ctx.liveRoutes, fallbackMinutes: ctx.fallbackMinutes, straightLineMiles: ctx.straightLineMiles, timeFactor: timeFactor(for: best.time, ctx: ctx, liveAnchor: windowStart))
+        let cliff = trafficCliff(in: candidates)
 
         logHistoricalSampleIfNeeded(ctx: ctx, trip: trip, at: windowStart, modelContext: modelContext)
 
@@ -93,6 +99,7 @@ enum RecommendationEngine {
             confidencePercent: confidence,
             isFallback: ctx.liveNowMinutes == nil,
             alreadyOptimal: alreadyOptimal,
+            trafficCliffTime: cliff?.time,
             routes: routes,
             candidates: candidates,
             originCoordinate: ctx.originCoordinate,
@@ -103,6 +110,18 @@ enum RecommendationEngine {
             reliabilityPercent: nil
         )
         return .success(recommendation)
+    }
+
+    /// A quick "if I left this exact moment" duration estimate, independent of any
+    /// Arrive-By target — used only to work out the earliest arrival time worth
+    /// offering in the Arrive By picker (current drive time + a 1-hour buffer),
+    /// before the user has picked a target for the full `recommendArriveBy` call
+    /// to search backward from.
+    static func quickLiveDuration(trip: Trip, simulateFailure: Bool, modelContext: ModelContext) async -> Int? {
+        guard let ctx = await resolveContext(
+            trip: trip, simulateFailure: simulateFailure, liveDepartureDate: Date(), modelContext: modelContext
+        ) else { return nil }
+        return Int((ctx.liveNowMinutes ?? ctx.fallbackMinutes).rounded())
     }
 
     // MARK: - Arrive-By mode
@@ -162,9 +181,12 @@ enum RecommendationEngine {
             reliability = 15
         }
 
+        let adjustedReliability = min(97, max(15, reliability + accuracyConfidenceAdjustment(routeKey: ctx.routeKey, modelContext: modelContext)))
+
         let timeSaved = max(0, baseline.durationMinutes - best.durationMinutes)
         let range = durationRange(around: best.durationMinutes, all: durations)
         let routes = buildRouteOptions(liveRoutes: ctx.liveRoutes, fallbackMinutes: ctx.fallbackMinutes, straightLineMiles: ctx.straightLineMiles, timeFactor: timeFactor(for: best.time, ctx: ctx, liveAnchor: referenceDate))
+        let cliff = trafficCliff(in: candidates)
 
         logHistoricalSampleIfNeeded(ctx: ctx, trip: trip, at: referenceDate, modelContext: modelContext)
 
@@ -178,9 +200,10 @@ enum RecommendationEngine {
             arrivalTime: best.arrivalTime,
             timeSavedMinutes: timeSaved,
             leaveNowDurationMinutes: baseline.durationMinutes,
-            confidencePercent: reliability,
+            confidencePercent: adjustedReliability,
             isFallback: ctx.liveNowMinutes == nil,
             alreadyOptimal: timeSaved <= 2,
+            trafficCliffTime: cliff?.time,
             routes: routes,
             candidates: candidates,
             originCoordinate: ctx.originCoordinate,
@@ -188,7 +211,7 @@ enum RecommendationEngine {
             routePolyline: ctx.liveRoutes?.first?.polyline,
             targetArrival: targetArrival,
             latestSafeDeparture: latestSafe?.time,
-            reliabilityPercent: reliability
+            reliabilityPercent: adjustedReliability
         )
         return .success(recommendation)
     }
@@ -294,6 +317,24 @@ enum RecommendationEngine {
             let duration = candidateDuration(timeFactor: factor, liveRoutes: ctx.liveRoutes, fallbackMinutes: ctx.fallbackMinutes)
             return CandidateResult(time: t, durationMinutes: duration)
         }
+    }
+
+    /// Scans the already-computed candidates (assumed in time order) for the
+    /// first consecutive pair whose slope — extra drive minutes per minute of
+    /// delay — crosses `trafficCliffSlopeThreshold`. Returns the candidate right
+    /// after that jump, i.e. the first point that's already past the cliff, or
+    /// nil if the window never climbs that sharply.
+    private static func trafficCliff(in candidates: [CandidateResult]) -> CandidateResult? {
+        guard candidates.count > 1 else { return nil }
+        for i in 0..<(candidates.count - 1) {
+            let stepMinutes = candidates[i + 1].time.timeIntervalSince(candidates[i].time) / 60
+            guard stepMinutes > 0 else { continue }
+            let slope = Double(candidates[i + 1].durationMinutes - candidates[i].durationMinutes) / stepMinutes
+            if slope >= trafficCliffSlopeThreshold {
+                return candidates[i + 1]
+            }
+        }
+        return nil
     }
 
     /// Blended expected minutes for the primary route at `t`, relative to the same
@@ -497,6 +538,31 @@ enum RecommendationEngine {
     }
 
     // MARK: - Confidence
+
+    /// Folds the user's own 0-5 "how accurate was this?" ratings (History) for
+    /// past trips on this exact route into confidence — the only real feedback
+    /// signal available, since the app has no background tracking to check its
+    /// duration estimates against directly. A single rating is too easily an
+    /// outlier to move confidence on its own, so this waits for at least 2.
+    /// Deliberately confidence-only, not a correction to the duration estimate
+    /// itself — a rating says whether the estimate felt right, not by how much or
+    /// which direction it was wrong, so there's nothing honest to recompute the
+    /// actual minutes from.
+    private static func accuracyConfidenceAdjustment(routeKey: String, modelContext: ModelContext) -> Int {
+        guard !routeKey.isEmpty else { return 0 }
+        let descriptor = FetchDescriptor<LoggedTrip>(predicate: #Predicate { $0.routeKey == routeKey })
+        guard let trips = try? modelContext.fetch(descriptor) else { return 0 }
+        let ratings = trips.compactMap(\.accuracyRating)
+        guard ratings.count >= 2 else { return 0 }
+        let average = Double(ratings.reduce(0, +)) / Double(ratings.count)
+        // 2.5/5 average is treated as neutral (no adjustment). Below neutral pulls
+        // confidence down harder than above neutral pulls it up — a run of
+        // inaccurate ratings on this exact route is a stronger warning sign than a
+        // run of accurate ones is a reason for extra confidence. Final clamping at
+        // the call site keeps this from pushing confidence outside its normal bounds.
+        let delta = average - 2.5
+        return Int((delta >= 0 ? delta * 4 : delta * 8).rounded())
+    }
 
     private static func confidenceScore(best: Double, all: [Double]) -> Int {
         let mean = all.reduce(0, +) / Double(all.count)

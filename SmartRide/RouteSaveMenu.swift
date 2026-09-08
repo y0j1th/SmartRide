@@ -13,10 +13,20 @@
 import SwiftUI
 
 struct RouteSaveMenu: View {
+    /// May literally be "Current Location" — Favorite Route and Route are meant
+    /// to stay live, re-resolving wherever the phone actually is whenever they're
+    /// next navigated, rather than freezing on wherever they were saved from.
     let origin: String
     let destination: String
     var travelMode: TravelMode = .driving
     var isEnabled: Bool = true
+    /// Origin to use for Add Recurring Reminder specifically — its schedule
+    /// refreshes in the background (RootView, independent of Home's live-location
+    /// UI), so it can't safely re-resolve the literal "Current Location" label the
+    /// way Navigate can. Defaults to `origin` for callers where the two are
+    /// already the same resolved text (e.g. History, where a logged trip's origin
+    /// is never that literal label).
+    var reminderOrigin: String? = nil
 
     @State private var activeAction: SaveAction?
 
@@ -65,7 +75,7 @@ struct RouteSaveMenu: View {
             case .route:
                 SaveRouteAsView(origin: origin, destination: destination, isFavorite: false)
             case .recurringReminder:
-                AddRecurringReminderView(prefilledOrigin: origin, prefilledDestination: destination, prefilledTravelMode: travelMode)
+                AddRecurringReminderView(prefilledOrigin: reminderOrigin ?? origin, prefilledDestination: destination, prefilledTravelMode: travelMode)
             }
         }
     }

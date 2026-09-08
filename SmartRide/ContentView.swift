@@ -12,6 +12,7 @@ import SwiftData
 import CoreLocation
 import MapKit
 import UniformTypeIdentifiers
+import UIKit
 
 /// Drag one stop's remove button and drop it onto the other stop's row to swap
 /// their order — with only ever up to 2 stops, "entered the other row" is a
@@ -61,6 +62,10 @@ struct ContentView: View {
     @State private var showSwapAlert = false
     @State private var activeStopPopoverID: UUID?
     @State private var draggingStopID: UUID?
+    /// Current ("if I left right now") drive time for the entered From/To, used
+    /// only to compute the Arrive By picker's earliest offerable time. Refreshed
+    /// whenever the route changes while Arrive By is the active mode.
+    @State private var currentNowMinutes: Int?
     /// The real place name behind "Current Location" (e.g. "Tracy, CA"), resolved
     /// in the background via reverse geocoding. Used whenever "Current Location"
     /// needs to appear as plain text elsewhere — swapped into Destination, or
@@ -91,7 +96,7 @@ struct ContentView: View {
                     tripCard
                         .zIndex(2)
 
-                    FavoriteChipsRow(favorites: favoritesWithAddress, onSelect: applyFavorite)
+                    FavoriteChipsRow(chips: quickChips)
                         .zIndex(1)
 
                     RouteMapView(
@@ -106,12 +111,12 @@ struct ContentView: View {
                     )
                     .zIndex(0)
 
-                    TripModeSelector(mode: $mode)
+                    TripModeSelector(mode: $mode, isEnabled: hasOriginAndDestination)
 
                     if mode == .departAt {
                         DepartureTimeSelector(selection: $departureOption, customDate: $customDate)
                     } else {
-                        ArriveBySelector(targetArrival: $targetArrival)
+                        ArriveBySelector(targetArrival: $targetArrival, minimum: minimumArriveBy)
                     }
 
                     if trip.isSameLocation {
@@ -159,6 +164,12 @@ struct ContentView: View {
                 .padding()
             }
             .navigationBarHidden(true)
+            // Tapping any blank area dismisses the keyboard (and, since that also
+            // drops focus, whatever field's suggestions dropdown was showing) —
+            // buttons and fields still get first crack at their own taps.
+            .onTapGesture {
+                dismissKeyboard()
+            }
             .alert("Can't Switch Yet", isPresented: $showSwapAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
@@ -186,10 +197,33 @@ struct ContentView: View {
                     // address behind it instead of freezing on that first, coarser fix.
                     trip.originCoordinate = location.coordinate
                     resolveCurrentLocationAddress(location)
+                } else if let originCoordinate = trip.originCoordinate, isSameLocation(originCoordinate, location.coordinate) {
+                    // A typed/picked From address that turns out to be right where the
+                    // phone actually is — switch it over to Current Location so it
+                    // keeps tracking live instead of freezing on this one coincidental
+                    // match (e.g. picking your own current position on the map).
+                    applyCurrentLocation(location)
                 }
             }
             .task(id: recomputeKey) {
                 await recompute()
+            }
+            .task(id: arriveByQuickKey) {
+                guard mode == .arriveBy, trip.isValid else {
+                    currentNowMinutes = nil
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard !Task.isCancelled else { return }
+                currentNowMinutes = await RecommendationEngine.quickLiveDuration(
+                    trip: trip, simulateFailure: appSettings.simulateAPIFailure, modelContext: modelContext
+                )
+                guard !Task.isCancelled else { return }
+                // The picker's own minimum just moved — pull the target up with it
+                // if it's now sitting before the earliest reachable time.
+                if targetArrival < minimumArriveBy {
+                    targetArrival = minimumArriveBy
+                }
             }
             .sheet(isPresented: $showAllTimes) {
                 if let recommendation {
@@ -369,8 +403,19 @@ struct ContentView: View {
         return rec.recommendedTime.timeIntervalSince(now) > 60
     }
 
+    /// Passes the raw origin (which may literally be "Current Location"), not the
+    /// resolved snapshot address — a saved Favorite Route/Route is meant to be
+    /// reused later, so it should re-resolve wherever the phone actually is *at
+    /// that later moment*, not freeze on wherever it was saved from. Recurring
+    /// Reminder gets the resolved address instead (`reminderOrigin`), since its
+    /// schedule refreshes in the background with no live GPS fix to resolve
+    /// against. (History and one-shot reminders are also the "already happened"
+    /// case, so those persist the resolved address too; see `originNameForLogging`.)
     private var saveRouteButton: some View {
-        RouteSaveMenu(origin: originNameForLogging, destination: trip.destination, travelMode: trip.travelMode, isEnabled: trip.isValid)
+        RouteSaveMenu(
+            origin: trip.origin, destination: trip.destination, travelMode: trip.travelMode,
+            isEnabled: trip.isValid, reminderOrigin: originNameForLogging
+        )
     }
 
     private var actionButtons: some View {
@@ -507,8 +552,39 @@ struct ContentView: View {
         try? modelContext.save()
     }
 
-    private var favoritesWithAddress: [FavoriteLocation] {
-        allFavorites.filter { !$0.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// Home and Office pinned first (in that order, only when each actually has an
+    /// address set), then Favorite Routes fill any remaining slots up to 3 total —
+    /// sourced live from the same `@Query` Routes uses, so a route saved, renamed,
+    /// or moved into/out of Favorites there shows up here immediately rather than
+    /// a separate, stale copy.
+    private var quickChips: [QuickChip] {
+        var chips: [QuickChip] = []
+        if let home = allFavorites.first(where: { $0.kind == .home }), !home.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            chips.append(QuickChip(id: "home", icon: home.kind.icon, label: home.name, action: { applyFavorite(home) }))
+        }
+        if let office = allFavorites.first(where: { $0.kind == .office }), !office.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            chips.append(QuickChip(id: "office", icon: office.kind.icon, label: office.name, action: { applyFavorite(office) }))
+        }
+        let remainingSlots = 3 - chips.count
+        if remainingSlots > 0 {
+            let favoriteRoutes = savedCommutes
+                .filter { $0.isFavorite }
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                .prefix(remainingSlots)
+            for route in favoriteRoutes {
+                chips.append(QuickChip(id: "route-\(route.persistentModelID.hashValue)", icon: "star.fill", label: route.name, action: { applyFavoriteRoute(route) }))
+            }
+        }
+        return chips
+    }
+
+    /// Loads both ends of a Favorite Route at once — unlike Home/Office (a single
+    /// address filling whichever field is next), a route replaces the whole trip.
+    private func applyFavoriteRoute(_ commute: SavedCommute) {
+        trip.origin = commute.origin
+        trip.originCoordinate = nil
+        trip.destination = commute.destination
+        trip.destinationCoordinate = nil
     }
 
     /// Fills From if it's blank, else To if that's blank, else replaces To (most
@@ -531,6 +607,13 @@ struct ContentView: View {
             appSettings.pendingOrigin = nil
             appSettings.pendingDestination = nil
             appSettings.pendingStops = nil
+            // A saved route's origin may literally be "Current Location" (kept
+            // unresolved on purpose so it stays live) — resolve it against wherever
+            // the phone actually is right now rather than waiting on the next
+            // incidental location tick, same as tapping the Current Location button.
+            if origin == Self.currentLocationLabel {
+                useCurrentLocationForOrigin()
+            }
         }
     }
 
@@ -584,14 +667,21 @@ struct ContentView: View {
         isLoading = false
     }
 
+    /// The Route Options entry currently in effect — whichever the user tapped,
+    /// falling back to the fastest (the UI's own default when nothing's been
+    /// explicitly picked yet).
+    private var selectedRoute: RouteOption? {
+        guard let routes = recommendation?.routes else { return nil }
+        return routes.first { $0.id == selectedRouteID } ?? routes.first { $0.isFastest } ?? routes.first
+    }
+
     /// A coordinate roughly at the midpoint of the currently-selected route's own
-    /// geometry (falling back to the fastest route, same default the UI shows),
-    /// used to force Google Maps onto that specific path. Nil when there's only
-    /// one route anyway (nothing to disambiguate) or no polyline is available.
+    /// geometry, used to force Google Maps onto that specific path. Nil when
+    /// there's only one route anyway (nothing to disambiguate) or no polyline is
+    /// available.
     private func selectedRouteMidpoint() -> CLLocationCoordinate2D? {
         guard let routes = recommendation?.routes, routes.count > 1 else { return nil }
-        let route = routes.first { $0.id == selectedRouteID } ?? routes.first { $0.isFastest } ?? routes.first
-        guard let polyline = route?.polyline, polyline.pointCount > 0 else { return nil }
+        guard let polyline = selectedRoute?.polyline, polyline.pointCount > 0 else { return nil }
         let midpoint = polyline.points()[polyline.pointCount / 2]
         return midpoint.coordinate
     }
@@ -605,12 +695,30 @@ struct ContentView: View {
         }
     }
 
+    /// Within ~50m counts as "the same place" for switching a typed/picked origin
+    /// over to Current Location — loose enough to absorb GPS drift and a
+    /// reverse-geocoded address not landing on the exact same rooftop point, tight
+    /// enough that a nearby-but-different address doesn't get relabeled.
+    private func isSameLocation(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Bool {
+        CLLocation(latitude: a.latitude, longitude: a.longitude)
+            .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude)) < 50
+    }
+
     private func applyCurrentLocation(_ location: CLLocation) {
+        // The Current Location button only shows while From is empty and focused
+        // (keyboard up); resigning first responder here — rather than leaving the
+        // field focused — is what stops the field's own suggestions search from
+        // firing on "Current Location" as if it were a typed query.
+        dismissKeyboard()
         trip.origin = Self.currentLocationLabel
         trip.originCoordinate = location.coordinate
         awaitingCurrentLocationForOrigin = false
         currentLocationResolvedAddress = nil
         resolveCurrentLocationAddress(location)
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
     private func resolveCurrentLocationAddress(_ location: CLLocation) {
@@ -676,6 +784,37 @@ struct ContentView: View {
         trip.origin == Self.currentLocationLabel ? (currentLocationResolvedAddress ?? trip.origin) : trip.origin
     }
 
+    /// Depart At / Arrive By only makes sense once there's an actual trip to time —
+    /// picking a mode before that just leaves the picker referring to nothing.
+    private var hasOriginAndDestination: Bool {
+        !trip.origin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !trip.destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Earliest arrival time worth offering: current drive time plus a 1-hour
+    /// buffer, rounded to the nearest 5 minutes — picking an arrival any sooner
+    /// than that isn't realistically reachable with any safety margin at all.
+    /// Falls back to a 20-minute drive assumption before the live estimate has
+    /// come back (e.g. right after typing a new destination).
+    private var minimumArriveBy: Date {
+        let minutes = currentNowMinutes ?? 20
+        let raw = Date().addingTimeInterval(Double(minutes + 60) * 60)
+        return Self.roundedToNearestFiveMinutes(raw)
+    }
+
+    private static func roundedToNearestFiveMinutes(_ date: Date) -> Date {
+        let fiveMinutes = 300.0
+        let interval = date.timeIntervalSinceReferenceDate
+        return Date(timeIntervalSinceReferenceDate: (interval / fiveMinutes).rounded() * fiveMinutes)
+    }
+
+    /// Only meaningful while Arrive By is active — empty (so the quick-duration
+    /// task above does nothing) whenever it isn't, so switching to Depart At
+    /// doesn't fire a redundant live lookup the main recommendation already covers.
+    private var arriveByQuickKey: String {
+        mode == .arriveBy ? trip.routeKey : ""
+    }
+
     private func scheduleReminder(for rec: Recommendation) {
         reminderInFlight = true
         reminderError = nil
@@ -703,17 +842,26 @@ struct ContentView: View {
         }
     }
 
+    /// "Start Navigation" always means leaving right now, so the logged departure
+    /// is the actual tap time — not `rec.recommendedTime`, which can lag a little
+    /// behind by the time the user actually taps (recommendations refresh
+    /// periodically, not on every render). Duration/arrival math uses whichever
+    /// Route Option is actually in effect, since an alternate (non-fastest) pick
+    /// can take longer than the recommendation's own fastest-route estimate.
     private func logTripStart() {
         guard let rec = recommendation else { return }
+        let route = selectedRoute
         let logged = LoggedTrip(
             origin: originNameForLogging,
             destination: trip.destination,
-            plannedDeparture: rec.recommendedTime,
+            plannedDeparture: Date(),
             predictedSavedMinutes: rec.timeSavedMinutes,
             confidencePercent: rec.confidencePercent,
-            expectedDurationMinutes: rec.expectedDurationMinutes,
+            expectedDurationMinutes: route?.durationMinutes ?? rec.expectedDurationMinutes,
             stopAddresses: trip.stops.map(\.address).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
-            travelMode: trip.travelMode
+            travelMode: trip.travelMode,
+            routeSummary: route?.fullRouteSummary ?? route?.summary,
+            routeKey: trip.routeKey
         )
         modelContext.insert(logged)
         try? modelContext.save()

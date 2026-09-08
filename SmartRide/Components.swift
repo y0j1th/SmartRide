@@ -8,19 +8,26 @@ import SwiftData
 
 // MARK: - Favorite Chips
 
+/// One tappable quick-fill chip — deliberately generic (icon/label/action) so the
+/// row can mix Home/Office (a single address) with Favorite Routes (an
+/// origin+destination pair) without the row itself knowing about either model.
+struct QuickChip: Identifiable {
+    let id: String
+    let icon: String
+    let label: String
+    let action: () -> Void
+}
+
 struct FavoriteChipsRow: View {
-    let favorites: [FavoriteLocation]
-    let onSelect: (FavoriteLocation) -> Void
+    let chips: [QuickChip]
 
     var body: some View {
-        if !favorites.isEmpty {
+        if !chips.isEmpty {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach(favorites) { favorite in
-                        Button {
-                            onSelect(favorite)
-                        } label: {
-                            Label(favorite.name, systemImage: favorite.kind.icon)
+                    ForEach(chips) { chip in
+                        Button(action: chip.action) {
+                            Label(chip.label, systemImage: chip.icon)
                                 .font(.footnote.weight(.medium))
                                 .padding(.vertical, 7)
                                 .padding(.horizontal, 12)
@@ -39,6 +46,7 @@ struct FavoriteChipsRow: View {
 
 struct TripModeSelector: View {
     @Binding var mode: TripMode
+    var isEnabled: Bool = true
 
     var body: some View {
         Picker("Mode", selection: $mode) {
@@ -47,6 +55,7 @@ struct TripModeSelector: View {
         }
         .pickerStyle(.segmented)
         .font(.subheadline.weight(.bold))
+        .disabled(!isEnabled)
     }
 }
 
@@ -121,6 +130,10 @@ struct DepartureTimeSelector: View {
 
 struct ArriveBySelector: View {
     @Binding var targetArrival: Date
+    /// Earliest offerable arrival — current drive time + a 1-hour buffer, rounded
+    /// to the nearest 5 minutes by the caller. Defaults to now for callers that
+    /// don't yet know the current drive time.
+    var minimum: Date = Date()
 
     var body: some View {
         HStack {
@@ -128,7 +141,7 @@ struct ArriveBySelector: View {
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
             Spacer()
-            DatePicker("Arrive by", selection: $targetArrival, in: Date()..., displayedComponents: [.date, .hourAndMinute])
+            DatePicker("Arrive by", selection: $targetArrival, in: minimum..., displayedComponents: [.date, .hourAndMinute])
                 .labelsHidden()
         }
     }
@@ -215,6 +228,12 @@ struct BestTimeToLeaveCard: View {
                     .foregroundStyle(.white.opacity(0.8))
             }
 
+            if let cliffText = rec.trafficCliffTimeText {
+                Text("Traffic Cliff: ~\(cliffText) — drive time jumps sharply after this.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
             if let onViewAllTimes, rec.candidates.count > 1 {
                 Button(action: onViewAllTimes) {
                     Label("View All Times", systemImage: "chart.bar.fill")
@@ -255,6 +274,12 @@ struct BestTimeToLeaveCard: View {
                 Text("After \(Recommendation.timeFormatter.string(from: latestSafe)): high risk of being late")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.5))
+            }
+
+            if let cliffText = rec.trafficCliffTimeText {
+                Text("Traffic Cliff: ~\(cliffText) — drive time jumps sharply after this.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -401,7 +426,8 @@ struct DepartureOptionCards: View {
             confidencePercent: recommendation.confidencePercent,
             expectedDurationMinutes: candidate.durationMinutes,
             stopAddresses: stops.map(\.address).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
-            travelMode: travelMode
+            travelMode: travelMode,
+            routeKey: Trip(origin: origin, destination: destination, stops: stops, travelMode: travelMode).routeKey
         )
         modelContext.insert(logged)
         try? modelContext.save()

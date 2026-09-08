@@ -67,11 +67,16 @@ struct AddRecurringReminderView: View {
 
     private let weekdaySymbols = Calendar.current.shortWeekdaySymbols // index 0 = Sunday = weekday 1
 
+    /// When set (only meaningful for a brand-new reminder), pre-selects this exact
+    /// day in specific-dates mode — Planner's calendar hands this in when the user
+    /// picks "Schedule Reminder" for a day they've selected, so they land straight
+    /// on that date instead of a blank weekly pattern.
     init(
         existing: RecurringReminder? = nil,
         prefilledOrigin: String = "",
         prefilledDestination: String = "",
-        prefilledTravelMode: TravelMode = .driving
+        prefilledTravelMode: TravelMode = .driving,
+        prefilledDate: Date? = nil
     ) {
         self.existing = existing
         _name = State(initialValue: existing?.name ?? "")
@@ -80,7 +85,11 @@ struct AddRecurringReminderView: View {
         _plannerMode = State(initialValue: existing?.plannerMode ?? .startAt)
         _travelMode = State(initialValue: existing?.travelMode ?? prefilledTravelMode)
         _selectedWeekdays = State(initialValue: Set(existing?.weekdays ?? [2, 3, 4, 5, 6]))
-        _specificDates = State(initialValue: existing?.specificDates ?? [])
+        if let prefilledDate, existing == nil {
+            _specificDates = State(initialValue: [Calendar.current.startOfDay(for: prefilledDate)])
+        } else {
+            _specificDates = State(initialValue: existing?.specificDates ?? [])
+        }
 
         var comps = DateComponents()
         comps.hour = existing?.hour ?? 8
@@ -299,7 +308,7 @@ struct AddRecurringReminderView: View {
                 }
                 .padding()
             }
-            .navigationTitle(existing == nil ? "Recurring Reminder" : "Edit Reminder")
+            .navigationTitle(navigationTitleText)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -414,6 +423,11 @@ struct AddRecurringReminderView: View {
             let names = dates.sorted().map { formatter.string(from: $0) }
             calendarConfirmationText = "Set for \(names.joined(separator: ", ")) — this reminder no longer repeats weekly."
         }
+    }
+
+    private var navigationTitleText: String {
+        guard existing == nil else { return "Edit Reminder" }
+        return specificDates.isEmpty ? "Recurring Reminder" : "Schedule Reminder"
     }
 
     private var previewText: String {

@@ -56,15 +56,18 @@ struct LocationSearchField: View {
             .textInputAutocapitalization(.words)
             .focused($isFocused)
             .onChange(of: text) { _, newValue in
-                // Only clear the coordinate when the user is actually the one
-                // editing this field (it has focus). A programmatic update — from
-                // "Current Location", a favorite chip, or the swap button — sets
-                // text and coordinate together while unfocused, and used to have
-                // its coordinate silently wiped out right back to nil here.
+                // Only search — and only clear the coordinate — when the user is
+                // actually the one editing this field (it has focus). A
+                // programmatic update — from "Current Location", a favorite chip,
+                // or the swap button — sets text and coordinate together; searching
+                // "Current Location" itself as a place query is exactly the bug
+                // that used to pop an unrelated suggestions list open underneath it.
                 if isFocused {
                     coordinate = nil
+                    completer.update(query: newValue)
+                } else {
+                    completer.clear()
                 }
-                completer.update(query: newValue)
             }
             .onSubmit {
                 isFocused = false

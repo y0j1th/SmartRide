@@ -16,6 +16,15 @@ private enum HistoryTab: String, CaseIterable {
     case reminders = "Reminders"
 }
 
+private enum HistoryRangePreset: String, CaseIterable, Identifiable {
+    case week = "Week"
+    case twoWeeks = "2 Weeks"
+    case month = "Month"
+    case custom = "Custom"
+
+    var id: String { rawValue }
+}
+
 struct HistoryView: View {
     @EnvironmentObject private var appSettings: AppSettings
     @Environment(\.modelContext) private var modelContext
@@ -24,14 +33,55 @@ struct HistoryView: View {
     @State private var selectedTab: HistoryTab = .trips
     @State private var expandedTripID: PersistentIdentifier?
 
-    private var weekTrips: [LoggedTrip] {
-        guard let weekStart = Calendar.current.dateInterval(of: .weekOfYear, for: Date())?.start else { return [] }
-        return trips.filter { $0.createdAt >= weekStart }
+    @State private var rangePreset: HistoryRangePreset = .week
+    @State private var customRangeStart: Date = Calendar.current.date(byAdding: .day, value: -6, to: Calendar.current.startOfDay(for: Date())) ?? Date()
+    @State private var customRangeEnd: Date = Date()
+
+    /// Start/end of whichever range is currently selected — one card, one figure,
+    /// instead of separate always-on week/month numbers.
+    private var selectedRange: (start: Date, end: Date) {
+        let calendar = Calendar.current
+        let now = Date()
+        switch rangePreset {
+        case .week:
+            let start = calendar.dateInterval(of: .weekOfYear, for: now)?.start ?? now
+            return (start, now)
+        case .twoWeeks:
+            let start = calendar.date(byAdding: .day, value: -13, to: calendar.startOfDay(for: now)) ?? now
+            return (start, now)
+        case .month:
+            let start = calendar.dateInterval(of: .month, for: now)?.start ?? now
+            return (start, now)
+        case .custom:
+            let start = calendar.startOfDay(for: customRangeStart)
+            let end = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: customRangeEnd)) ?? customRangeEnd
+            return (start, end)
+        }
     }
 
-    private var monthTrips: [LoggedTrip] {
-        guard let monthStart = Calendar.current.dateInterval(of: .month, for: Date())?.start else { return [] }
-        return trips.filter { $0.createdAt >= monthStart }
+    private var rangeTrips: [LoggedTrip] {
+        let range = selectedRange
+        return trips.filter { $0.createdAt >= range.start && $0.createdAt < range.end }
+    }
+
+    /// How the range reads in a sentence — "You've saved X ___."
+    private var rangePhrase: String {
+        switch rangePreset {
+        case .week: return "this week"
+        case .twoWeeks: return "in the last 2 weeks"
+        case .month: return "this month"
+        case .custom: return "in this range"
+        }
+    }
+
+    /// The exact dates the selected range covers, e.g. "Sep 1 - Sep 7" — spelled
+    /// out on the card itself so the stats' scope isn't just implied by a label.
+    private var rangeDatesText: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+        let range = selectedRange
+        let displayEnd = rangePreset == .custom ? customRangeEnd : (Calendar.current.date(byAdding: .second, value: -1, to: range.end) ?? range.end)
+        return "\(formatter.string(from: range.start)) - \(formatter.string(from: displayEnd))"
     }
 
     /// Reminders whose time has already passed — the ones still ahead of now stay
@@ -40,6 +90,41 @@ struct HistoryView: View {
     /// it's been started.
     private var pastReminders: [ReminderItem] {
         allReminders.filter { $0.scheduledTime < Date() }
+    }
+
+    /// Trips bucketed by calendar day, most recent day first. `trips` is already
+    /// sorted newest-first, so a single pass — starting a new bucket whenever the
+    /// day changes — keeps both the day order and each day's own trip order intact
+    /// without needing a separate sort afterward.
+    private var tripsByDay: [(day: Date, items: [LoggedTrip])] {
+        groupedByDay(trips, date: \.createdAt)
+    }
+
+    /// Same day-bucketing as trips, applied to past reminders (already sorted
+    /// newest-first).
+    private var remindersByDay: [(day: Date, items: [ReminderItem])] {
+        groupedByDay(pastReminders, date: \.scheduledTime)
+    }
+
+    private func groupedByDay<T>(_ items: [T], date: (T) -> Date) -> [(day: Date, items: [T])] {
+        let calendar = Calendar.current
+        var result: [(day: Date, items: [T])] = []
+        for item in items {
+            let day = calendar.startOfDay(for: date(item))
+            if let lastIndex = result.indices.last, result[lastIndex].day == day {
+                result[lastIndex].items.append(item)
+            } else {
+                result.append((day: day, items: [item]))
+            }
+        }
+        return result
+    }
+
+    private func dayTitle(_ day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "Today" }
+        if calendar.isDateInYesterday(day) { return "Yesterday" }
+        return day.formatted(date: .complete, time: .omitted)
     }
 
     var body: some View {
@@ -81,9 +166,11 @@ struct HistoryView: View {
                     }
                     .listRowBackground(Color.clear)
 
-                    Section("Trips") {
-                        ForEach(trips) { trip in
-                            tripRow(trip)
+                    ForEach(tripsByDay, id: \.day) { group in
+                        Section(dayTitle(group.day)) {
+                            ForEach(group.items) { trip in
+                                tripRow(trip)
+                            }
                         }
                     }
                 }
@@ -101,8 +188,12 @@ struct HistoryView: View {
                 )
             } else {
                 List {
-                    ForEach(pastReminders) { reminder in
-                        ReminderRowView(reminder: reminder, allowEdit: false, allowDelete: false)
+                    ForEach(remindersByDay, id: \.day) { group in
+                        Section(dayTitle(group.day)) {
+                            ForEach(group.items) { reminder in
+                                ReminderRowView(reminder: reminder, allowEdit: false, allowDelete: false)
+                            }
+                        }
                     }
                 }
             }
@@ -111,31 +202,53 @@ struct HistoryView: View {
 
     private var weeklyIntelligenceCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Your Commute This Week")
+            Text("Your Commute")
                 .font(.headline)
 
-            if weekTrips.isEmpty {
-                Text("No trips logged yet this week.")
+            Picker("Range", selection: $rangePreset) {
+                ForEach(HistoryRangePreset.allCases) { preset in
+                    Text(preset.rawValue).tag(preset)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            if rangePreset == .custom {
+                HStack(spacing: 10) {
+                    DatePicker("From", selection: $customRangeStart, in: ...Date(), displayedComponents: .date)
+                        .labelsHidden()
+                    Text("to")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    DatePicker("To", selection: $customRangeEnd, in: customRangeStart...Date(), displayedComponents: .date)
+                        .labelsHidden()
+                }
+            }
+
+            Text(rangeDatesText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if rangeTrips.isEmpty {
+                Text("No trips logged \(rangePhrase).")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
-                let avgDuration = weekTrips.map(\.expectedDurationMinutes).reduce(0, +) / weekTrips.count
-                let weekSaved = weekTrips.map(\.predictedSavedMinutes).reduce(0, +)
+                let avgDuration = rangeTrips.map(\.expectedDurationMinutes).reduce(0, +) / rangeTrips.count
+                let rangeSaved = rangeTrips.map(\.predictedSavedMinutes).reduce(0, +)
 
                 HStack {
                     statColumn("Average", Recommendation.minutesText(avgDuration))
                     Divider().frame(height: 34)
-                    statColumn("Trips Logged", "\(weekTrips.count)")
+                    statColumn("Trips Logged", "\(rangeTrips.count)")
                     Divider().frame(height: 34)
-                    statColumn("Time Saved", Recommendation.minutesText(weekSaved))
+                    statColumn("Time Saved", Recommendation.minutesText(rangeSaved))
                 }
-            }
 
-            let monthSaved = monthTrips.map(\.predictedSavedMinutes).reduce(0, +)
-            if monthSaved > 0 {
-                Text("You've saved \(Recommendation.minutesText(monthSaved)) this month.")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(Color.accentColor)
+                if rangeSaved > 0 {
+                    Text("You've saved \(Recommendation.minutesPhrase(rangeSaved)) \(rangePhrase).")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                }
             }
         }
         .padding(16)
@@ -177,7 +290,7 @@ struct HistoryView: View {
                         Text("\(trip.origin) → \(trip.destination)")
                             .font(.headline)
                             .foregroundStyle(.primary)
-                        Text(trip.createdAt.formatted(date: .abbreviated, time: .omitted))
+                        Text(trip.createdAt.formatted(date: .omitted, time: .shortened))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -194,12 +307,17 @@ struct HistoryView: View {
             if isExpanded {
                 VStack(alignment: .leading, spacing: 8) {
                     routeStops(trip)
+                    if let routeSummary = trip.routeSummary, !routeSummary.isEmpty {
+                        detailRow(label: "Selected Route", value: routeSummary)
+                    }
                     detailRow(label: "Travel Mode", value: trip.travelMode.label)
-                    detailRow(label: "Departed", value: trip.plannedDeparture.formatted(date: .abbreviated, time: .shortened))
-                    detailRow(label: "Arrived", value: arrival.formatted(date: .abbreviated, time: .shortened))
+                    detailRow(label: "Left At", value: trip.plannedDeparture.formatted(date: .abbreviated, time: .shortened))
+                    detailRow(label: "Expected Arrival", value: arrival.formatted(date: .abbreviated, time: .shortened))
                     detailRow(label: "Duration", value: Recommendation.minutesText(trip.expectedDurationMinutes))
                     detailRow(label: "Time Saved", value: Recommendation.minutesText(trip.predictedSavedMinutes))
                     detailRow(label: "Confidence", value: "\(trip.confidencePercent)%")
+
+                    accuracyRatingRow(trip)
 
                     HStack(spacing: 10) {
                         Button {
@@ -252,6 +370,53 @@ struct HistoryView: View {
             Text(value)
                 .font(.subheadline)
         }
+    }
+
+    /// Lets the user say how close the predicted duration/arrival actually was,
+    /// per trip — the app has no background tracking to check this itself, so
+    /// this is the only honest way to learn whether estimates are trustworthy.
+    /// 0-5, colored red-to-green, so the scale reads at a glance without needing
+    /// to look at the number.
+    private func accuracyRatingRow(_ trip: LoggedTrip) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("How accurate was this estimate?")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                ForEach(0...5, id: \.self) { value in
+                    let isSelected = trip.accuracyRating == value
+                    Button {
+                        setAccuracyRating(trip, value: value)
+                    } label: {
+                        Text("\(value)")
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 32, height: 32)
+                            .background(ratingColor(value).opacity(isSelected ? 1 : 0.2), in: Circle())
+                            .foregroundStyle(isSelected ? .white : .primary)
+                            .overlay(
+                                Circle().stroke(ratingColor(value), lineWidth: isSelected ? 0 : 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            if let rating = trip.accuracyRating {
+                Text("Rated \(rating)/5")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// 0 (red) to 5 (green), stepping through the hue wheel — no separate lookup
+    /// table needed since red and green sit at opposite ends of it.
+    private func ratingColor(_ value: Int) -> Color {
+        Color(hue: (Double(value) / 5) * 0.33, saturation: 0.75, brightness: 0.85)
+    }
+
+    private func setAccuracyRating(_ trip: LoggedTrip, value: Int) {
+        trip.accuracyRating = value
+        try? modelContext.save()
     }
 
     private func travelAgain(_ trip: LoggedTrip) {

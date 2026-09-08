@@ -16,6 +16,7 @@ struct AddCommuteView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
     @Query private var savedCommutes: [SavedCommute]
+    @Query private var allFavorites: [FavoriteLocation]
 
     let existing: SavedCommute?
     let isFavorite: Bool
@@ -65,6 +66,26 @@ struct AddCommuteView: View {
         return !trimmedName.isEmpty && !a.isEmpty && !b.isEmpty && a.lowercased() != b.lowercased() && !isDuplicateName
     }
 
+    /// Not a validation error — just a heads-up when a field exactly matches your
+    /// Home or Office address, since that place is already one tap away as its own
+    /// quick chip on Home; saving is still allowed either way.
+    private func matchedPlaceLabel(for text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        for kind: FavoriteKind in [.home, .office] {
+            guard let favorite = allFavorites.first(where: { $0.kind == kind }) else { continue }
+            let favoriteAddress = favorite.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !favoriteAddress.isEmpty else { continue }
+            if favoriteAddress.caseInsensitiveCompare(trimmed) == .orderedSame {
+                return kind == .home ? "Home" : "Office"
+            }
+        }
+        return nil
+    }
+
+    private var originMatch: String? { matchedPlaceLabel(for: origin) }
+    private var destinationMatch: String? { matchedPlaceLabel(for: destination) }
+
     private func fieldLabel(_ text: String) -> some View {
         Text(text.uppercased())
             .font(.caption.weight(.semibold))
@@ -88,11 +109,21 @@ struct AddCommuteView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         fieldLabel("From")
                         LocationSearchField(placeholder: "Starting point", text: $origin, coordinate: $originCoordinate)
+                        if let originMatch {
+                            Text("Matches your \(originMatch) address.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .zIndex(2)
                     VStack(alignment: .leading, spacing: 6) {
                         fieldLabel("To")
                         LocationSearchField(placeholder: "Destination", text: $destination, coordinate: $destinationCoordinate)
+                        if let destinationMatch {
+                            Text("Matches your \(destinationMatch) address.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .zIndex(1)
 

@@ -266,6 +266,11 @@ struct Recommendation {
     let confidencePercent: Int
     let isFallback: Bool
     let alreadyOptimal: Bool
+    /// The first point, scanning forward through `candidates`, where drive time
+    /// starts climbing sharply rather than drifting — leaving after this moment
+    /// costs noticeably more per minute of delay than leaving before it. Nil if
+    /// nothing in the window jumps that sharply.
+    var trafficCliffTime: Date? = nil
 
     /// Route alternatives for the recommended departure time.
     let routes: [RouteOption]
@@ -304,7 +309,25 @@ struct Recommendation {
     static func minutesText(_ minutes: Int) -> String {
         let h = minutes / 60
         let m = minutes % 60
-        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+        if h > 0 && m > 0 { return "\(h)h \(m)m" }
+        if h > 0 { return "\(h)h" }
+        return "\(m)m"
+    }
+
+    /// Same duration, spelled out in full words ("1 hour 1 min" rather than
+    /// "1h 1m") — used in prose sentences (History's "You've saved…" lines) where
+    /// the compact abbreviation used everywhere else reads awkwardly.
+    static func minutesPhrase(_ minutes: Int) -> String {
+        let h = minutes / 60
+        let m = minutes % 60
+        let hourPart = h > 0 ? "\(h) hour\(h == 1 ? "" : "s")" : nil
+        let minutePart = m > 0 ? "\(m) min" : nil
+        switch (hourPart, minutePart) {
+        case (let h?, let m?): return "\(h) \(m)"
+        case (let h?, nil): return h
+        case (nil, let m?): return m
+        case (nil, nil): return "0 min"
+        }
     }
 
     var recommendedTimeText: String { Self.timeFormatter.string(from: recommendedTime) }
@@ -314,6 +337,9 @@ struct Recommendation {
     }
     var targetArrivalText: String? {
         targetArrival.map { Self.timeFormatter.string(from: $0) }
+    }
+    var trafficCliffTimeText: String? {
+        trafficCliffTime.map { Self.timeFormatter.string(from: $0) }
     }
 
     var durationText: String { Self.minutesText(expectedDurationMinutes) }

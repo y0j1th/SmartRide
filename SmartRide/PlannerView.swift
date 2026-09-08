@@ -23,6 +23,7 @@ struct PlannerView: View {
     @State private var editingReminder: RecurringReminder?
     @State private var selectedDate: Date?
     @State private var expandedReminderID: PersistentIdentifier?
+    @State private var showScheduleForSelectedDate = false
 
     private var upcomingReminders: [ReminderItem] {
         allReminders.filter { $0.scheduledTime >= Date() }
@@ -76,6 +77,11 @@ struct PlannerView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+            }
+            Button {
+                showScheduleForSelectedDate = true
+            } label: {
+                Label("Schedule Reminder for This Day", systemImage: "calendar.badge.plus")
             }
         } header: {
             Text("Reminders on \(date.formatted(date: .abbreviated, time: .omitted))")
@@ -149,6 +155,9 @@ struct PlannerView: View {
             .sheet(isPresented: $showAddRecurring) {
                 AddRecurringReminderView(existing: editingReminder)
             }
+            .sheet(isPresented: $showScheduleForSelectedDate) {
+                AddRecurringReminderView(prefilledDate: selectedDate)
+            }
             .task {
                 // Covers opening Planner without ever visiting Home first, and
                 // fills in the distance for any reminder whose own creation-time
@@ -170,38 +179,53 @@ struct PlannerView: View {
         }
     }
 
-    /// Collapsed shows just the name (plus the enable toggle); tapping expands
-    /// in place to show the route/schedule details (read-only) and a Navigate
-    /// button. Editing is only reachable through the swipe action, alongside delete.
+    /// Collapsed shows just the name; tapping anywhere in that leading section
+    /// (not just the name text) expands it in place to show the route/schedule
+    /// details (read-only). A dedicated Navigate icon sits beside it, same as a
+    /// Route in Routes — works with a single tap whether or not the row is
+    /// expanded. Long-press for Edit and Delete — a context menu instead of swipe
+    /// actions, matching Routes. Enabling/disabling stays on the inline toggle
+    /// only, since duplicating it into the menu would be redundant.
     private func recurringRow(_ reminder: RecurringReminder) -> some View {
         let isExpanded = expandedReminderID == reminder.persistentModelID
         return VStack(alignment: .leading, spacing: 10) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    expandedReminderID = isExpanded ? nil : reminder.persistentModelID
+            HStack(spacing: 12) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        expandedReminderID = isExpanded ? nil : reminder.persistentModelID
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "repeat.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(reminder.isEnabled ? Color.accentColor : .secondary)
+                        Text(reminder.name)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
                 }
-            } label: {
-                HStack(alignment: .center, spacing: 10) {
-                    Image(systemName: "repeat.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(reminder.isEnabled ? Color.accentColor : .secondary)
-                    Text(reminder.name)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { reminder.isEnabled },
-                        set: { toggleRecurring(reminder, isEnabled: $0) }
-                    ))
-                    .labelsHidden()
-                    Image(systemName: "chevron.down")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Toggle("", isOn: Binding(
+                    get: { reminder.isEnabled },
+                    set: { toggleRecurring(reminder, isEnabled: $0) }
+                ))
+                .labelsHidden()
+
+                Button {
+                    navigate(origin: reminder.origin, destination: reminder.destination)
+                } label: {
+                    Image(systemName: "location.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 30, height: 30)
+                        .background(Color.accentColor.opacity(0.15), in: Circle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
@@ -210,42 +234,24 @@ struct PlannerView: View {
                     detailRow(label: "Type", value: reminder.plannerMode.label)
                     detailRow(label: "Schedule", value: "\(reminder.timeText) · \(reminder.weekdaysText)")
                     detailRow(label: "Notify", value: reminder.leadText + (reminder.cachedDistanceMiles.map { String(format: " · ~%.0f mi", $0) } ?? ""))
-                    Button {
-                        navigate(origin: reminder.origin, destination: reminder.destination)
-                    } label: {
-                        Label("Navigate", systemImage: "location.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 4)
                 }
                 .padding(.leading, 32)
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .padding(.vertical, 4)
-        // Same app-wide convention: swipe left-to-right (leading) for Edit,
-        // right-to-left (trailing) for Delete — separate edges, not stacked on
-        // one. The app also sets a custom global accent tint (Profile >
-        // Appearance), which otherwise overrides the destructive role's default
-        // red here, so both need an explicit tint regardless.
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+        .contextMenu {
             Button {
                 editingReminder = reminder
                 showAddRecurring = true
             } label: {
                 Label("Edit", systemImage: "pencil")
             }
-            .tint(.blue)
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button(role: .destructive) {
                 deleteRecurring(reminder)
             } label: {
                 Label("Delete", systemImage: "trash")
             }
-            .tint(.red)
         }
     }
 
