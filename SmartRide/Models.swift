@@ -113,7 +113,8 @@ enum TravelMode: String, CaseIterable, Hashable {
 
     /// MapKit has no bicycling or motorcycle transport type — both route over the
     /// same road network a car would, so `.automobile` is the closest real routing
-    /// available; `durationScaleFactor` corrects the resulting duration.
+    /// available; `adjustedMinutes(rawMinutes:distanceMiles:)` corrects the
+    /// resulting duration.
     var mkTransportType: MKDirectionsTransportType {
         switch self {
         case .driving, .biking, .motorcycling: return .automobile
@@ -122,16 +123,39 @@ enum TravelMode: String, CaseIterable, Hashable {
         }
     }
 
-    /// Multiplies the automobile-routed duration to approximate this mode's real
-    /// travel time, since MapKit can only give us a driving route to start from.
-    /// Motorcycles keep pace with car traffic closely enough to leave as-is; bikes
-    /// are meaningfully slower on the same roads, especially anywhere with highway
-    /// segments a bike wouldn't actually take — an acknowledged approximation, not
-    /// a real bike-routing engine.
-    var durationScaleFactor: Double {
+    /// Approximates this mode's real travel time from the automobile-routed
+    /// duration MapKit gave us, since it can't route bicycles or motorcycles
+    /// directly. Motorcycles keep pace with car traffic closely enough to use the
+    /// driving time as-is. Bikes are handled differently and deliberately: rather
+    /// than multiplying the driving *time* by a flat, arbitrary factor (a bike
+    /// doesn't uniformly take "N times as long" as a car — it's simply slower, and
+    /// a flat time-ratio has no physical grounding), this applies the actual
+    /// formula for travel time — Time = Distance ÷ Speed — using the route's real
+    /// distance (still meaningful regardless of which mode MapKit computed it for)
+    /// divided by `fallbackAverageSpeedMph`'s bicycling figure (12 mph, a commonly
+    /// cited average urban cycling speed). Same formula this file already uses for
+    /// the no-live-data fallback case, just applied here to a real fetched
+    /// distance instead of a straight-line one.
+    func adjustedMinutes(rawMinutes: Double, distanceMiles: Double) -> Double {
         switch self {
-        case .biking: return 2.2
-        case .driving, .motorcycling, .walking, .transit: return 1.0
+        case .biking:
+            return (distanceMiles / fallbackAverageSpeedMph) * 60
+        case .driving, .motorcycling, .walking, .transit:
+            return rawMinutes
+        }
+    }
+
+    /// Whether this mode's duration meaningfully changes with time-of-day
+    /// congestion. Driving/motorcycling/biking share the road with car traffic and
+    /// genuinely have rush hours; walking doesn't (a route takes the same time at
+    /// 7am or 5pm), and transit runs on a timetable rather than congestion. Gates
+    /// the engine's whole time-of-day blend — without this, a walking or transit
+    /// trip could get a fabricated "Traffic Cliff" or "leave later, save 8 min"
+    /// that has no physical basis.
+    var isTrafficSensitive: Bool {
+        switch self {
+        case .driving, .motorcycling, .biking: return true
+        case .walking, .transit: return false
         }
     }
 

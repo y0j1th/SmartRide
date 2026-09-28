@@ -163,6 +163,8 @@ struct PlannerView: View {
                 // fills in the distance for any reminder whose own creation-time
                 // refresh hadn't finished yet by the time this list was checked.
                 await RecurringReminderScheduler.refreshAll(modelContext: modelContext)
+                // Re-arms the background refresh chain (see BackgroundReminderRefresher).
+                BackgroundReminderRefresher.scheduleNext(modelContext: modelContext)
             }
         }
     }

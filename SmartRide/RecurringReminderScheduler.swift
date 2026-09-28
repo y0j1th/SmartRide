@@ -44,6 +44,44 @@ enum RecurringReminderScheduler {
         NotificationManager.cancelReminder(id: reminder.oneShotIdentifier)
     }
 
+    /// The soonest alert moment among today's enabled reminders — used only to
+    /// tell the background refresh task (`BackgroundReminderRefresher`) roughly
+    /// when a check would actually be useful, so it can aim for something close
+    /// to "shortly before this," rather than a flat interval with no relation to
+    /// what's actually due. This is a target to aim for, not a promise — iOS
+    /// alone decides whether and when the background task actually gets to run.
+    /// Reach By's real leave time isn't known without a live check, so its target
+    /// arrival time stands in as the reference point for "how soon does this matter."
+    static func nearestUpcomingAlertTime(modelContext: ModelContext) -> Date? {
+        let descriptor = FetchDescriptor<RecurringReminder>(predicate: #Predicate { $0.isEnabled })
+        guard let reminders = try? modelContext.fetch(descriptor) else { return nil }
+        let calendar = Calendar.current
+        let now = Date()
+        var earliest: Date?
+
+        for reminder in reminders {
+            let matchesToday = reminder.usesSpecificDates
+                ? reminder.specificDates.contains { calendar.isDate($0, inSameDayAs: now) }
+                : reminder.weekdays.contains(calendar.component(.weekday, from: now))
+            guard matchesToday else { continue }
+            guard let occurrence = calendar.date(bySettingHour: reminder.hour, minute: reminder.minute, second: 0, of: now) else { continue }
+
+            let alertTime: Date
+            switch reminder.plannerMode {
+            case .startAt:
+                alertTime = occurrence.addingTimeInterval(-Double(reminder.leadMinutes) * 60)
+            case .reachBy:
+                alertTime = occurrence
+            }
+
+            guard alertTime > now else { continue }
+            if earliest == nil || alertTime < earliest! {
+                earliest = alertTime
+            }
+        }
+        return earliest
+    }
+
     // MARK: - Start At
 
     private static func refreshStartAt(_ reminder: RecurringReminder, modelContext: ModelContext, simulateFailure: Bool) async {

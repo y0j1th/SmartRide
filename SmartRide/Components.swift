@@ -253,27 +253,35 @@ struct BestTimeToLeaveCard: View {
             Text("ARRIVE BY \(rec.targetArrivalText ?? "")")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.6))
+            // The big number is always the DEPARTURE time, not the arrival —
+            // labeling it explicitly stops it from reading as if the app
+            // contradicted the "Arrive By" time directly above it.
+            Text("LEAVE AT")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.5))
             Text(rec.recommendedTimeText)
                 .font(.system(size: 44, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
-            Text("Best departure · \(rec.durationText) drive · arrive \(rec.arrivalTimeText)")
+            Text("\(rec.durationText) drive · arrive \(rec.arrivalTimeText)")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.white.opacity(0.9))
 
-            if let latestSafeText = rec.latestSafeDepartureText {
-                Text("Latest safe: \(latestSafeText) · \(rec.reliabilityPercent ?? rec.confidencePercent)% reliability")
+            if rec.latestSafeDeparture != nil {
+                // "Leave At" above is already the latest departure that's
+                // predicted to arrive right at the target — no separate, earlier
+                // "safe" time exists anymore, so this only needs to state the
+                // reliability of cutting it that close, and the real consequence
+                // of missing this exact window.
+                Text("\(rec.reliabilityPercent ?? rec.confidencePercent)% reliability leaving exactly at this time")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.6))
+                Text("After \(rec.recommendedTimeText): high risk of being late")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.5))
             } else {
                 Text("Not achievable in this window — try an earlier target")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.orange)
-            }
-
-            if let latestSafe = rec.latestSafeDeparture {
-                Text("After \(Recommendation.timeFormatter.string(from: latestSafe)): high risk of being late")
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.5))
             }
 
             if let cliffText = rec.trafficCliffTimeText {

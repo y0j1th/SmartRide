@@ -119,7 +119,7 @@ struct RouteMapView: View {
                     Marker("Selected", systemImage: "mappin.circle.fill", coordinate: pickedCoordinate).tint(.red)
                 }
             }
-            .mapStyle(.standard(elevation: .flat))
+            .mapStyle(.standard(elevation: .flat, showsTraffic: true))
             .gesture(
                 SpatialTapGesture().onEnded { value in
                     guard let coordinate = proxy.convert(value.location, from: .local) else { return }

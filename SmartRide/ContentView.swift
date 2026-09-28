@@ -182,6 +182,10 @@ struct ContentView: View {
                 }
                 Task { await SmartAlertChecker.checkAll(appSettings: appSettings, modelContext: modelContext) }
                 Task { await RecurringReminderScheduler.refreshAll(modelContext: modelContext, simulateFailure: appSettings.simulateAPIFailure) }
+                // Re-arms the background refresh chain on every real app use —
+                // BGAppRefreshTaskRequest is one-shot, so this keeps a fresh one
+                // pending rather than only ever having the one from launch.
+                BackgroundReminderRefresher.scheduleNext(modelContext: modelContext)
             }
             .onChange(of: appSettings.selectedTab) { _, newValue in
                 if newValue == AppSettings.homeTabIndex { loadPendingCommuteIfNeeded() }
@@ -225,10 +229,32 @@ struct ContentView: View {
                     targetArrival = minimumArriveBy
                 }
             }
+            .task {
+                await periodicRefreshLoop()
+            }
             .sheet(isPresented: $showAllTimes) {
                 if let recommendation {
                     AllDepartureTimesView(recommendation: recommendation)
                 }
+            }
+        }
+    }
+
+    /// Live traffic otherwise only gets fetched when an input actually changes —
+    /// if the screen just sits open with the same trip, the one live sample it
+    /// started with silently goes stale. This keeps it honest by quietly
+    /// re-fetching every few minutes for as long as the screen stays open, same
+    /// as re-editing a field would. SwiftUI cancels this `.task` on its own once
+    /// the view disappears, so there's nothing to clean up manually.
+    /// 5 minutes (not 3) because each refresh now fetches the full multi-point
+    /// live curve (~11 calls, not 1) — traffic a real 15-minute-spaced checkpoint
+    /// away from stale doesn't need checking again every 3 minutes.
+    private func periodicRefreshLoop() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 300_000_000_000)
+            guard !Task.isCancelled else { return }
+            if trip.isValid {
+                await recompute(silent: true)
             }
         }
     }
@@ -617,21 +643,42 @@ struct ContentView: View {
         }
     }
 
-    private func recompute() async {
-        reminderSet = false
-        reminderError = nil
-        addressError = nil
+    /// `silent` is what the periodic background refresh (below) uses: it updates
+    /// the numbers with fresh live traffic without disturbing anything the user is
+    /// mid-interaction with — no loading skeleton flash, no clearing a route they
+    /// manually picked, no resetting "Reminder Set" back to unset, and critically,
+    /// no writing a new HistoricalSample. Logging on every silent refresh would
+    /// have every 3-minute tick pile more weight onto whatever moment the screen
+    /// happened to be left open at, skewing the historical pattern store toward
+    /// that instead of genuinely varied real-world sampling.
+    ///
+    /// A silent refresh runs on its own timer, entirely independent of
+    /// `.task(id: recomputeKey)` — it isn't cancelled just because the user edited
+    /// something while its ~11 live checkpoint calls were still in flight. Without
+    /// a staleness check, a silent refresh that happened to start against the old
+    /// trip could finish *after* the edit's own fresh recompute and overwrite the
+    /// screen with an answer for a trip that isn't even showing anymore. Snapshot
+    /// the key before starting, and only apply the result if it still matches.
+    private func recompute(silent: Bool = false) async {
+        let keyAtStart = recomputeKey
+        if !silent {
+            reminderSet = false
+            reminderError = nil
+            addressError = nil
+        }
         guard trip.isValid else {
-            recommendation = nil
+            if !silent { recommendation = nil }
             return
         }
 
-        // Debounce: task(id:) cancels this on every keystroke, so only the last
-        // edit's task survives the sleep and actually hits the network.
-        try? await Task.sleep(nanoseconds: 400_000_000)
-        guard !Task.isCancelled else { return }
+        if !silent {
+            // Debounce: task(id:) cancels this on every keystroke, so only the last
+            // edit's task survives the sleep and actually hits the network.
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            isLoading = true
+        }
 
-        isLoading = true
         let outcome: RecommendationOutcome
         switch mode {
         case .departAt:
@@ -639,32 +686,43 @@ struct ContentView: View {
                 trip: trip,
                 departureOption: departureOption,
                 simulateFailure: appSettings.simulateAPIFailure,
-                modelContext: modelContext
+                modelContext: modelContext,
+                logHistory: !silent
             )
         case .arriveBy:
             outcome = await RecommendationEngine.recommendArriveBy(
                 trip: trip,
                 targetArrival: targetArrival,
                 simulateFailure: appSettings.simulateAPIFailure,
-                modelContext: modelContext
+                modelContext: modelContext,
+                logHistory: !silent
             )
         }
         guard !Task.isCancelled else { return }
+        if silent && recomputeKey != keyAtStart {
+            // Something more current has already taken over — a stale silent
+            // answer for a trip that's no longer showing is worse than no update.
+            return
+        }
 
         switch outcome {
         case .success(let rec):
             recommendation = rec
-            selectedRouteID = nil // defaults back to the fastest route for the new recommendation
+            if !silent {
+                selectedRouteID = nil // defaults back to the fastest route for the new recommendation
+            }
             // Keeps the map's pins accurate even when the user typed a full address
             // without tapping a search suggestion (which is the only other path that
             // sets these coordinates).
             trip.originCoordinate = rec.originCoordinate
             trip.destinationCoordinate = rec.destinationCoordinate
         case .invalidAddress(let message):
-            recommendation = nil
-            addressError = message
+            if !silent {
+                recommendation = nil
+                addressError = message
+            }
         }
-        isLoading = false
+        if !silent { isLoading = false }
     }
 
     /// The Route Options entry currently in effect — whichever the user tapped,

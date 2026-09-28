@@ -38,11 +38,15 @@ enum RecommendationEngine {
 
     private static let candidateStepMinutes = 5
     private static let candidateWindowMinutes = 150 // ~2.5 hours of continuous prediction
-    private static let liveHorizonMinutes = 150.0
     /// Minutes of extra drive time per minute of delay past which a jump counts as
     /// a "cliff" rather than ordinary traffic drift — tuned so a slow, steady climb
     /// doesn't trigger it, but the sharp knee where rush hour actually bites does.
     private static let trafficCliffSlopeThreshold = 0.6
+    /// Spacing between the extra live checkpoints fetched across the window — 15
+    /// minutes gives 10 extra live readings (+15 through +150 min) across the
+    /// 2.5-hour window, closely tracking a real rush-hour rise and fall instead of
+    /// only roughly bracketing it.
+    private static let checkpointStepMinutes = 15
 
     // MARK: - Depart-At mode
 
@@ -51,7 +55,8 @@ enum RecommendationEngine {
         departureOption: DepartureOption,
         simulateFailure: Bool,
         referenceDate: Date = Date(),
-        modelContext: ModelContext
+        modelContext: ModelContext,
+        logHistory: Bool = true
     ) async -> RecommendationOutcome {
         let windowStart = startDate(for: departureOption, referenceDate: referenceDate)
 
@@ -84,7 +89,9 @@ enum RecommendationEngine {
         let routes = buildRouteOptions(liveRoutes: ctx.liveRoutes, fallbackMinutes: ctx.fallbackMinutes, straightLineMiles: ctx.straightLineMiles, timeFactor: timeFactor(for: best.time, ctx: ctx, liveAnchor: windowStart))
         let cliff = trafficCliff(in: candidates)
 
-        logHistoricalSampleIfNeeded(ctx: ctx, trip: trip, at: windowStart, modelContext: modelContext)
+        if logHistory {
+            logHistoricalSampleIfNeeded(ctx: ctx, trip: trip, at: windowStart, modelContext: modelContext)
+        }
 
         let recommendation = Recommendation(
             referenceNow: referenceDate,
@@ -131,7 +138,8 @@ enum RecommendationEngine {
         targetArrival: Date,
         simulateFailure: Bool,
         referenceDate: Date = Date(),
-        modelContext: ModelContext
+        modelContext: ModelContext,
+        logHistory: Bool = true
     ) async -> RecommendationOutcome {
         guard let ctx = await resolveContext(
             trip: trip, simulateFailure: simulateFailure, liveDepartureDate: referenceDate, modelContext: modelContext
@@ -159,20 +167,31 @@ enum RecommendationEngine {
         let mean = durations.reduce(0, +) / Double(durations.count)
         let variance = durations.reduce(0) { $0 + pow($1 - mean, 2) } / Double(durations.count)
         let stdDev = sqrt(variance)
-        let bufferMinutes = max(5, Int((stdDev * 0.8).rounded()))
 
         let best: CandidateResult
         let latestSafe: CandidateResult?
         let reliability: Int
 
-        if let latest = onTime.max(by: { $0.time < $1.time }) {
-            latestSafe = latest
-            let safeCandidates = onTime.filter {
-                $0.arrivalTime.addingTimeInterval(Double(bufferMinutes) * 60) <= targetArrival
-            }
-            best = safeCandidates.max(by: { $0.time < $1.time }) ?? onTime.min(by: { $0.time < $1.time })!
-            let marginMinutes = targetArrival.timeIntervalSince(best.arrivalTime) / 60
-            reliability = Int(min(97, max(35, 60 + (marginMinutes / max(stdDev, 1)) * 15)))
+        if let latest = onTime.max(by: { $0.time < $1.time }),
+           case let preciseTime = targetArrival.addingTimeInterval(-Double(latest.durationMinutes) * 60),
+           preciseTime >= referenceDate {
+            // "Leave at" = arrive-by time minus the actual predicted duration —
+            // exactly, to the minute, not whichever 5-minute-grid candidate
+            // happened to land on-time. `latest` finds the right duration to use
+            // (the traffic-aware estimate for departing around this time); this
+            // then recomputes the departure precisely from the target itself, so
+            // the arrival lands exactly at the target rather than up to 5 minutes
+            // before it purely as an artifact of the candidate grid. No safety
+            // buffer is subtracted either — "arrive by 6:15" means exactly that,
+            // not some earlier, unrequested cushion time. Reliability instead
+            // reflects how consistent this route's traffic normally is — a
+            // low-variance route can be cut this close with real confidence; a
+            // highly variable one can't, and that's reflected in the percentage,
+            // not by silently leaving early.
+            best = CandidateResult(time: preciseTime, durationMinutes: latest.durationMinutes)
+            latestSafe = best
+            let variabilityRatio = stdDev / max(mean, 1)
+            reliability = Int(min(97, max(35, 90 - variabilityRatio * 220)))
         } else {
             // Nothing in the window arrives on time — recommend leaving as soon as
             // possible anyway and say so honestly, rather than pretending otherwise.
@@ -188,7 +207,9 @@ enum RecommendationEngine {
         let routes = buildRouteOptions(liveRoutes: ctx.liveRoutes, fallbackMinutes: ctx.fallbackMinutes, straightLineMiles: ctx.straightLineMiles, timeFactor: timeFactor(for: best.time, ctx: ctx, liveAnchor: referenceDate))
         let cliff = trafficCliff(in: candidates)
 
-        logHistoricalSampleIfNeeded(ctx: ctx, trip: trip, at: referenceDate, modelContext: modelContext)
+        if logHistory {
+            logHistoricalSampleIfNeeded(ctx: ctx, trip: trip, at: referenceDate, modelContext: modelContext)
+        }
 
         let recommendation = Recommendation(
             referenceNow: referenceDate,
@@ -231,6 +252,9 @@ enum RecommendationEngine {
         let hasTolls: Bool
         let highwaySummary: String?
         let polyline: MKPolyline?
+        /// Fraction of this route's distance spent on a numbered highway (0 = all
+        /// surface streets, 1 = all highway) — drives `trafficSensitivity`.
+        let highwayDistanceFraction: Double
     }
 
     private struct Context {
@@ -240,9 +264,20 @@ enum RecommendationEngine {
         let straightLineMiles: Double
         let history: [Int: Double]
         let historicalPointsUsed: Int
+        /// Distinct calendar days this route has real data from — what personal
+        /// trust (`blendedMinutes`) actually weights on, since a single trip now
+        /// logs several checkpoint samples at once.
+        let distinctDaysSampled: Int
         let routeKey: String
+        let travelMode: TravelMode
         let originCoordinate: CLLocationCoordinate2D
         let destinationCoordinate: CLLocationCoordinate2D
+        /// Extra live samples at future departure times (offset in minutes from
+        /// `liveDepartureDate`, paired with Apple's own traffic-aware minutes for
+        /// that specific future time) — real per-time signal, not an assumption
+        /// reshaped from the one "now" reading. Empty for non-traffic-sensitive
+        /// modes (walking/transit) or when the live fetch failed.
+        let liveCheckpoints: [(offsetMinutes: Int, minutes: Double)]
     }
 
     private static func resolveContext(
@@ -265,20 +300,19 @@ enum RecommendationEngine {
         let fallbackMinutes = max(5.0, (straightLineMiles / trip.travelMode.fallbackAverageSpeedMph) * 60.0)
 
         var liveRoutes: [LiveRoute]?
-        let scaleFactor = trip.travelMode.durationScaleFactor
         if !simulateFailure {
             if stopLocations.isEmpty {
                 if let mkRoutes = try? await fetchRoutes(
                     from: originLocation.coordinate, to: destinationLocation.coordinate,
                     departureDate: liveDepartureDate, transportType: trip.travelMode.mkTransportType
                 ) {
-                    liveRoutes = mkRoutes.map { liveRoute(from: $0, scaleFactor: scaleFactor) }
+                    liveRoutes = mkRoutes.map { liveRoute(from: $0, travelMode: trip.travelMode) }
                 }
             } else {
                 let waypoints = [originLocation.coordinate] + stopLocations.map(\.coordinate) + [destinationLocation.coordinate]
                 if let combined = try? await fetchMultiLegRoute(
                     waypoints: waypoints, departureDate: liveDepartureDate,
-                    transportType: trip.travelMode.mkTransportType, scaleFactor: scaleFactor
+                    transportType: trip.travelMode.mkTransportType, travelMode: trip.travelMode
                 ) {
                     liveRoutes = [combined]
                 }
@@ -286,26 +320,91 @@ enum RecommendationEngine {
         }
         let liveNowMinutes = liveRoutes?.map { $0.expectedTravelTime / 60 }.min()
 
+        var liveCheckpoints: [(offsetMinutes: Int, minutes: Double)] = []
+        if let liveNowMinutes {
+            liveCheckpoints.append((0, liveNowMinutes))
+        }
+        if !simulateFailure && trip.travelMode.isTrafficSensitive {
+            liveCheckpoints.append(contentsOf: await fetchLiveCheckpoints(
+                originLocation: originLocation, destinationLocation: destinationLocation, stopLocations: stopLocations,
+                anchor: liveDepartureDate, transportType: trip.travelMode.mkTransportType, travelMode: trip.travelMode
+            ))
+        }
+
         let routeKey = trip.routeKey
         let dow = Calendar.current.component(.weekday, from: liveDepartureDate)
-        let history = historicalMinutesByBucket(routeKey: routeKey, dayOfWeek: dow, modelContext: modelContext)
+        let (history, distinctDaysSampled) = historicalMinutesByBucket(routeKey: routeKey, dayOfWeek: dow, modelContext: modelContext)
 
         return Context(
             liveRoutes: liveRoutes, liveNowMinutes: liveNowMinutes, fallbackMinutes: fallbackMinutes,
             straightLineMiles: straightLineMiles, history: history,
-            historicalPointsUsed: history.count, routeKey: routeKey,
-            originCoordinate: originLocation.coordinate, destinationCoordinate: destinationLocation.coordinate
+            historicalPointsUsed: history.count, distinctDaysSampled: distinctDaysSampled,
+            routeKey: routeKey, travelMode: trip.travelMode,
+            originCoordinate: originLocation.coordinate, destinationCoordinate: destinationLocation.coordinate,
+            liveCheckpoints: liveCheckpoints.sorted { $0.offsetMinutes < $1.offsetMinutes }
         )
     }
 
-    private static func liveRoute(from route: MKRoute, scaleFactor: Double) -> LiveRoute {
-        LiveRoute(
+    /// Fetches Apple's own traffic-aware duration at several future departure
+    /// times across the window, concurrently. This is real per-time signal from
+    /// MapKit itself — the same mechanism the Maps app uses for "leave now" vs.
+    /// "leave in an hour" — not an assumption manufactured by reshaping the one
+    /// "now" reading with a personal historical store that might not have any
+    /// data yet. Crucial for a brand-new route: without this, its very first
+    /// prediction would be predicted completely flat until enough personal
+    /// history built up over many real trips.
+    private static func fetchLiveCheckpoints(
+        originLocation: CLLocation, destinationLocation: CLLocation, stopLocations: [CLLocation],
+        anchor: Date, transportType: MKDirectionsTransportType, travelMode: TravelMode
+    ) async -> [(offsetMinutes: Int, minutes: Double)] {
+        let offsets = Array(stride(from: checkpointStepMinutes, through: candidateWindowMinutes, by: checkpointStepMinutes))
+        return await withTaskGroup(of: (offsetMinutes: Int, minutes: Double)?.self) { group in
+            for offset in offsets {
+                group.addTask {
+                    let departureDate = anchor.addingTimeInterval(Double(offset) * 60)
+                    do {
+                        let minutes: Double
+                        if stopLocations.isEmpty {
+                            let routes = try await fetchRoutes(
+                                from: originLocation.coordinate, to: destinationLocation.coordinate,
+                                departureDate: departureDate, transportType: transportType
+                            )
+                            guard let fastest = routes.first else { return nil }
+                            minutes = travelMode.adjustedMinutes(
+                                rawMinutes: fastest.expectedTravelTime / 60, distanceMiles: fastest.distance / 1609.34
+                            )
+                        } else {
+                            let waypoints = [originLocation.coordinate] + stopLocations.map(\.coordinate) + [destinationLocation.coordinate]
+                            let combined = try await fetchMultiLegRoute(
+                                waypoints: waypoints, departureDate: departureDate,
+                                transportType: transportType, travelMode: travelMode
+                            )
+                            minutes = combined.expectedTravelTime / 60
+                        }
+                        return (offset, minutes)
+                    } catch {
+                        return nil
+                    }
+                }
+            }
+            var results: [(offsetMinutes: Int, minutes: Double)] = []
+            for await result in group {
+                if let result { results.append(result) }
+            }
+            return results
+        }
+    }
+
+    private static func liveRoute(from route: MKRoute, travelMode: TravelMode) -> LiveRoute {
+        let minutes = travelMode.adjustedMinutes(rawMinutes: route.expectedTravelTime / 60, distanceMiles: route.distance / 1609.34)
+        return LiveRoute(
             name: route.name.isEmpty ? nil : route.name,
-            expectedTravelTime: route.expectedTravelTime * scaleFactor,
+            expectedTravelTime: minutes * 60,
             distance: route.distance,
             hasTolls: route.advisoryNotices.contains { $0.localizedCaseInsensitiveContains("toll") },
             highwaySummary: highwayChain(steps: route.steps),
-            polyline: route.polyline
+            polyline: route.polyline,
+            highwayDistanceFraction: highwayDistanceFraction(steps: route.steps, totalDistance: route.distance)
         )
     }
 
@@ -338,59 +437,84 @@ enum RecommendationEngine {
     }
 
     /// Blended expected minutes for the primary route at `t`, relative to the same
-    /// quantity at `liveAnchor` (where the one real live sample was taken). 1.0 means
-    /// "same as right now."
+    /// quantity at `liveAnchor`. 1.0 means "same as right now." Always exactly 1.0
+    /// for a non-traffic-sensitive mode (walking, transit) — congestion-based
+    /// time-of-day blending has no physical basis for a walk, and transit runs on
+    /// a timetable, not traffic, so treating either as if it had a rush hour would
+    /// only manufacture a fake pattern out of noise.
     private static func timeFactor(for t: Date, ctx: Context, liveAnchor: Date) -> Double {
+        guard ctx.travelMode.isTrafficSensitive else { return 1 }
         let anchorBlended = blendedMinutes(at: liveAnchor, referenceForTrust: liveAnchor, ctx: ctx)
         guard anchorBlended > 0 else { return 1 }
         let blended = blendedMinutes(at: t, referenceForTrust: liveAnchor, ctx: ctx)
         return blended / anchorBlended
     }
 
-    private static func blendedMinutes(at t: Date, referenceForTrust: Date, ctx: Context) -> Double {
-        let bucket = minuteBucket(for: t)
-        let anchorBucket = minuteBucket(for: referenceForTrust)
-        let anchorHistorical = ctx.history[anchorBucket]
-        let historicalEstimate = ctx.history[bucket] ?? ctx.liveNowMinutes ?? ctx.fallbackMinutes
-
-        let liveEstimate: Double
-        if let liveNowMinutes = ctx.liveNowMinutes {
-            if let anchorHistorical, anchorHistorical > 0 {
-                liveEstimate = liveNowMinutes * (historicalEstimate / anchorHistorical)
-            } else {
-                liveEstimate = liveNowMinutes
-            }
-        } else {
-            liveEstimate = historicalEstimate
+    /// Interpolates between the two checkpoints (see `fetchLiveCheckpoints`)
+    /// bracketing `t`'s offset from `anchor` — real Apple-predicted minutes at
+    /// real future times, not a ratio projected from a single reading. Extends
+    /// flat past either end of the fetched range rather than extrapolating
+    /// unboundedly. Nil only when no checkpoints were fetched at all (e.g. a
+    /// non-traffic-sensitive mode, or every checkpoint request failed).
+    private static func checkpointMinutes(at t: Date, anchor: Date, checkpoints: [(offsetMinutes: Int, minutes: Double)]) -> Double? {
+        guard !checkpoints.isEmpty else { return nil }
+        let offset = t.timeIntervalSince(anchor) / 60
+        guard let first = checkpoints.first, let last = checkpoints.last else { return nil }
+        if offset <= Double(first.offsetMinutes) { return first.minutes }
+        if offset >= Double(last.offsetMinutes) { return last.minutes }
+        for i in 0..<(checkpoints.count - 1) {
+            let a = checkpoints[i], b = checkpoints[i + 1]
+            guard offset >= Double(a.offsetMinutes), offset <= Double(b.offsetMinutes) else { continue }
+            let span = Double(b.offsetMinutes - a.offsetMinutes)
+            guard span > 0 else { return a.minutes }
+            let fraction = (offset - Double(a.offsetMinutes)) / span
+            return a.minutes + (b.minutes - a.minutes) * fraction
         }
-
-        let minutesFromNow = abs(t.timeIntervalSince(referenceForTrust)) / 60
-        let liveTrust: Double
-        if ctx.liveNowMinutes == nil || minutesFromNow > liveHorizonMinutes {
-            liveTrust = 0
-        } else {
-            liveTrust = max(0.35, 1 - minutesFromNow / liveHorizonMinutes)
-        }
-
-        return liveTrust * liveEstimate + (1 - liveTrust) * historicalEstimate
+        return last.minutes
     }
 
-    /// Applies a time-sensitivity multiplier per route (see file header) and returns
+    /// Blends two independent real signals: Apple's own multi-point live traffic
+    /// prediction for this exact route (available from the very first time it's
+    /// ever entered), and your personal historical average for this route, if
+    /// you've built any up. Personal trust scales with distinct days you've
+    /// actually driven this route (capped well short of fully replacing the live
+    /// signal) — not raw sample count, since one trip now logs ~10 checkpoints at
+    /// once and counting those as independent observations would let 1-2 uses
+    /// max out "personal" trust before there's any real personal pattern to trust.
+    private static func blendedMinutes(at t: Date, referenceForTrust: Date, ctx: Context) -> Double {
+        let bucket = minuteBucket(for: t)
+        let baseline = ctx.liveNowMinutes ?? ctx.fallbackMinutes
+        let checkpointEstimate = checkpointMinutes(at: t, anchor: referenceForTrust, checkpoints: ctx.liveCheckpoints) ?? baseline
+        let historicalEstimate = interpolatedHistoricalMinutes(at: bucket, in: ctx.history, fallback: checkpointEstimate)
+
+        let personalTrust = min(0.7, Double(ctx.distinctDaysSampled) / 10.0)
+        return personalTrust * historicalEstimate + (1 - personalTrust) * checkpointEstimate
+    }
+
+    /// How much a route's own duration should react to the window's time factor —
+    /// grounded in a real, measurable property of the route (how much of it is
+    /// numbered highway) rather than an arbitrary constant or a comparison to
+    /// whichever route happens to be fastest right now. This follows traffic flow
+    /// theory's "fundamental diagram": limited-access highways show sharp,
+    /// nonlinear speed drops as they approach capacity (classic rush-hour
+    /// behavior), while signal-controlled surface streets are governed more by
+    /// fixed signal timing and speed limits, so their travel time is comparatively
+    /// stable across the day. A route that's 100% highway scales at 1.3x the
+    /// window's time factor; one that's 0% highway (all surface streets) scales at
+    /// 0.5x; anything in between scales linearly with its actual highway fraction.
+    private static func trafficSensitivity(for route: LiveRoute) -> Double {
+        0.5 + 0.8 * route.highwayDistanceFraction
+    }
+
+    /// Applies each route's own sensitivity (see `trafficSensitivity`) and returns
     /// the best (minimum) duration across all fetched routes for this time factor —
     /// this is the joint route+departure-time optimization.
     private static func candidateDuration(timeFactor: Double, liveRoutes: [LiveRoute]?, fallbackMinutes: Double) -> Int {
         guard let liveRoutes, !liveRoutes.isEmpty else {
             return Int((fallbackMinutes * timeFactor).rounded())
         }
-        let fastest = liveRoutes[0]
         let options = liveRoutes.map { route -> Double in
-            let sensitivity: Double
-            if route.id == fastest.id {
-                sensitivity = 1.3
-            } else {
-                let ratio = route.expectedTravelTime / fastest.expectedTravelTime
-                sensitivity = ratio <= 1.35 ? 0.9 : 0.6
-            }
+            let sensitivity = trafficSensitivity(for: route)
             let adjustedFactor = max(0.5, 1 + (timeFactor - 1) * sensitivity)
             return (route.expectedTravelTime / 60) * adjustedFactor
         }
@@ -407,12 +531,19 @@ enum RecommendationEngine {
 
     // MARK: - Historical logging
 
+    /// Logs every live checkpoint fetched for this recommendation, not just the
+    /// "now" one — one real trip request now contributes several genuine
+    /// data points spread across the day's time buckets instead of a single one,
+    /// so the personal historical store builds up meaningfully faster.
     private static func logHistoricalSampleIfNeeded(ctx: Context, trip: Trip, at date: Date, modelContext: ModelContext) {
-        guard let liveNowMinutes = ctx.liveNowMinutes else { return }
-        let dow = Calendar.current.component(.weekday, from: date)
-        modelContext.insert(HistoricalSample(
-            routeKey: ctx.routeKey, dayOfWeek: dow, minuteOfDayBucket: minuteBucket(for: date), travelMinutes: liveNowMinutes
-        ))
+        guard !ctx.liveCheckpoints.isEmpty else { return }
+        for checkpoint in ctx.liveCheckpoints {
+            let sampleDate = date.addingTimeInterval(Double(checkpoint.offsetMinutes) * 60)
+            let dow = Calendar.current.component(.weekday, from: sampleDate)
+            modelContext.insert(HistoricalSample(
+                routeKey: ctx.routeKey, dayOfWeek: dow, minuteOfDayBucket: minuteBucket(for: sampleDate), travelMinutes: checkpoint.minutes
+            ))
+        }
         try? modelContext.save()
     }
 
@@ -462,9 +593,16 @@ enum RecommendationEngine {
     /// waypoint request) and summing durations/distances, concatenating polylines
     /// and turn-by-turn steps. Each leg's departure is offset by the running total
     /// so far, so the whole chain reflects one continuous trip rather than every
-    /// leg independently assuming it starts at the original departure time.
+    /// leg independently assuming it starts at the original departure time. The
+    /// mode adjustment is applied per leg, before that offset — MapKit only ever
+    /// routes at automobile speed, so for biking the *actual* (distance-based)
+    /// time spent on leg 1 is what determines what time you'd really be starting
+    /// leg 2, and thus what traffic conditions leg 2's own query should be asking
+    /// about. Applying the adjustment only once at the end, after already chaining
+    /// departures off the raw automobile durations, would ask every leg after the
+    /// first for traffic at a time earlier than you'd actually be there.
     private static func fetchMultiLegRoute(
-        waypoints: [CLLocationCoordinate2D], departureDate: Date, transportType: MKDirectionsTransportType, scaleFactor: Double
+        waypoints: [CLLocationCoordinate2D], departureDate: Date, transportType: MKDirectionsTransportType, travelMode: TravelMode
     ) async throws -> LiveRoute {
         guard waypoints.count >= 2 else { throw RecommendationError.directionsFailed }
 
@@ -486,22 +624,25 @@ enum RecommendationEngine {
             let response = try await MKDirections(request: request).calculate()
             guard let leg = response.routes.first else { throw RecommendationError.directionsFailed }
 
-            totalTime += leg.expectedTravelTime
+            let legMinutes = travelMode.adjustedMinutes(rawMinutes: leg.expectedTravelTime / 60, distanceMiles: leg.distance / 1609.34)
+            let scaledLegTime = legMinutes * 60
+            totalTime += scaledLegTime
             totalDistance += leg.distance
             if leg.advisoryNotices.contains(where: { $0.localizedCaseInsensitiveContains("toll") }) { hasTolls = true }
             allSteps.append(contentsOf: leg.steps)
             combinedCoordinates.append(contentsOf: leg.polyline.coordinates)
-            legDeparture = legDeparture.addingTimeInterval(leg.expectedTravelTime)
+            legDeparture = legDeparture.addingTimeInterval(scaledLegTime)
         }
 
         let combinedPolyline = combinedCoordinates.isEmpty ? nil : MKPolyline(coordinates: combinedCoordinates, count: combinedCoordinates.count)
         return LiveRoute(
             name: "Multi-stop route",
-            expectedTravelTime: totalTime * scaleFactor,
+            expectedTravelTime: totalTime,
             distance: totalDistance,
             hasTolls: hasTolls,
             highwaySummary: highwayChain(steps: allSteps),
-            polyline: combinedPolyline
+            polyline: combinedPolyline,
+            highwayDistanceFraction: highwayDistanceFraction(steps: allSteps, totalDistance: totalDistance)
         )
     }
 
@@ -524,17 +665,97 @@ enum RecommendationEngine {
         return (minuteOfDay / 5) * 5
     }
 
-    private static func historicalMinutesByBucket(routeKey: String, dayOfWeek: Int, modelContext: ModelContext) -> [Int: Double] {
-        let descriptor = FetchDescriptor<HistoricalSample>(
-            predicate: #Predicate { $0.routeKey == routeKey && $0.dayOfWeek == dayOfWeek }
-        )
-        guard let samples = try? modelContext.fetch(descriptor), !samples.isEmpty else { return [:] }
+    /// A sample older than this has decayed to roughly half its original weight in
+    /// the average — traffic patterns drift (new construction, seasonal changes,
+    /// a schedule that's shifted), so a 3-month-old sample shouldn't count exactly
+    /// as much as one from last week forever.
+    private static let recencyHalfLifeDays = 30.0
 
-        var buckets: [Int: [Double]] = [:]
+    /// Weekday (Mon-Fri) vs weekend (Sat/Sun) — rush-hour patterns repeat across
+    /// the whole workweek, so pooling every weekday's samples together gives each
+    /// time-of-day bucket far more real data to average than restricting to the
+    /// exact same day-of-week (e.g. only Tuesdays) ever would, especially early on
+    /// when the store hasn't built up much history yet.
+    private static func isWeekday(_ dayOfWeek: Int) -> Bool {
+        (2...6).contains(dayOfWeek)
+    }
+
+    /// `distinctDaysSampled` is what personal-trust weighting (`blendedMinutes`)
+    /// actually keys off, not the raw bucket count below — a single real trip now
+    /// logs ~10 checkpoint samples across as many buckets, so counting buckets
+    /// would treat one drive as if it were ten independent observations. Counting
+    /// distinct calendar days instead means "how many times have you actually
+    /// driven this route," which is what personal trust should really track.
+    private static func historicalMinutesByBucket(
+        routeKey: String, dayOfWeek: Int, modelContext: ModelContext
+    ) -> (buckets: [Int: Double], distinctDaysSampled: Int) {
+        let descriptor = FetchDescriptor<HistoricalSample>(predicate: #Predicate { $0.routeKey == routeKey })
+        guard let allSamples = try? modelContext.fetch(descriptor), !allSamples.isEmpty else { return ([:], 0) }
+
+        let wantWeekday = isWeekday(dayOfWeek)
+        let samples = allSamples.filter { isWeekday($0.dayOfWeek) == wantWeekday }
+        guard !samples.isEmpty else { return ([:], 0) }
+
+        let calendar = Calendar.current
+        let distinctDays = Set(samples.map { calendar.startOfDay(for: $0.recordedAt) }).count
+
+        let now = Date()
+        var weightedSums: [Int: Double] = [:]
+        var weightTotals: [Int: Double] = [:]
         for sample in samples {
-            buckets[sample.minuteOfDayBucket, default: []].append(sample.travelMinutes)
+            let ageDays = max(0, now.timeIntervalSince(sample.recordedAt) / 86400)
+            let weight = pow(0.5, ageDays / recencyHalfLifeDays)
+            weightedSums[sample.minuteOfDayBucket, default: 0] += sample.travelMinutes * weight
+            weightTotals[sample.minuteOfDayBucket, default: 0] += weight
         }
-        return buckets.mapValues { $0.reduce(0, +) / Double($0.count) }
+        let buckets = weightedSums.reduce(into: [Int: Double]()) { result, entry in
+            result[entry.key] = entry.value / weightTotals[entry.key]!
+        }
+        return (buckets, distinctDays)
+    }
+
+    /// Looks up the historical estimate for a specific 5-minute bucket. Bracketed
+    /// by two real neighboring samples, it interpolates fully between them (real
+    /// data on both sides, fully trusted). With only one neighbor in range, it
+    /// fades that lone sample's influence toward `fallback` the further away this
+    /// bucket is, rather than repeating that single value flatly across the whole
+    /// hour-wide search radius — flat-carrying one lone point was exactly what
+    /// produced fake plateaus (with a single fake "jump" right at the search
+    /// radius's edge) instead of a real curve.
+    private static func interpolatedHistoricalMinutes(at bucket: Int, in history: [Int: Double], fallback: Double) -> Double {
+        if let exact = history[bucket] { return exact }
+        guard !history.isEmpty else { return fallback }
+
+        let maxSearchMinutes = 60
+        var before: (bucket: Int, value: Double)?
+        var after: (bucket: Int, value: Double)?
+        var offset = 5
+        while offset <= maxSearchMinutes {
+            if before == nil, let v = history[bucket - offset] { before = (bucket - offset, v) }
+            if after == nil, let v = history[bucket + offset] { after = (bucket + offset, v) }
+            if before != nil && after != nil { break }
+            offset += 5
+        }
+
+        func fadeToward(_ point: (bucket: Int, value: Double)) -> Double {
+            let distance = Double(abs(bucket - point.bucket))
+            let trust = max(0, 1 - distance / Double(maxSearchMinutes))
+            return point.value * trust + fallback * (1 - trust)
+        }
+
+        switch (before, after) {
+        case (let b?, let a?):
+            let span = Double(a.bucket - b.bucket)
+            guard span > 0 else { return b.value }
+            let t = Double(bucket - b.bucket) / span
+            return b.value + (a.value - b.value) * t
+        case (let b?, nil):
+            return fadeToward(b)
+        case (nil, let a?):
+            return fadeToward(a)
+        case (nil, nil):
+            return fallback
+        }
     }
 
     // MARK: - Confidence
@@ -593,15 +814,8 @@ enum RecommendationEngine {
             ]
         }
 
-        let fastest = liveRoutes[0]
         var scored: [(route: LiveRoute, minutes: Double)] = liveRoutes.map { route in
-            let sensitivity: Double
-            if route.id == fastest.id {
-                sensitivity = 1.3
-            } else {
-                let ratio = route.expectedTravelTime / fastest.expectedTravelTime
-                sensitivity = ratio <= 1.35 ? 0.9 : 0.6
-            }
+            let sensitivity = trafficSensitivity(for: route)
             let adjustedFactor = max(0.5, 1 + (timeFactor - 1) * sensitivity)
             return (route, (route.expectedTravelTime / 60) * adjustedFactor)
         }
@@ -647,6 +861,22 @@ enum RecommendationEngine {
         }
         guard !found.isEmpty else { return nil }
         return found.joined(separator: " → ")
+    }
+
+    /// Fraction of the route's total distance spent on a step tagged as a
+    /// numbered highway — the measurable, per-route input to `trafficSensitivity`.
+    private static func highwayDistanceFraction(steps: [MKRoute.Step], totalDistance: CLLocationDistance) -> Double {
+        guard totalDistance > 0, let regex = try? NSRegularExpression(pattern: #"\b(?:I|US|CA|SR)-\d+(?:\s[NSEW])?\b"#) else { return 0 }
+        var highwayDistance: CLLocationDistance = 0
+        for step in steps {
+            let text = step.instructions
+            guard !text.isEmpty else { continue }
+            let range = NSRange(text.startIndex..., in: text)
+            if regex.firstMatch(in: text, range: range) != nil {
+                highwayDistance += step.distance
+            }
+        }
+        return min(1, highwayDistance / totalDistance)
     }
 }
 
